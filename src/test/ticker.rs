@@ -1,6 +1,5 @@
 use std::sync::{Arc, LazyLock};
 
-use anyhow::Context;
 use arrow::{
     array::{RecordBatch, StringArray, StringBuilder, TimestampNanosecondBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
@@ -9,8 +8,8 @@ use chrono::{DateTime, Utc};
 use rand::{Rng, seq::IndexedRandom};
 
 use crate::test::{
-    TestArrowType,
-    random_time::{self, random_date, random_time_between},
+    TestArrowType, TestError,
+    random_time::{random_date, random_time_between},
 };
 const TICKERS: &[&str] = &[
     "AAPL", "GOOG", "MSFT", "AMZN", "TSLA", "META", "NVDA", "NFLX", "ADBE", "INTC", "STLA", "FIG",
@@ -40,7 +39,7 @@ impl TestArrowType for TickerItem {
         let mut random_time = random_time_between(ninet, four);
 
         for i in 0..n {
-            random_time = random_time + chrono::Duration::seconds(rng.random_range(0..=60));
+            random_time += chrono::Duration::seconds(rng.random_range(0..=60));
             results.push(Self {
                 ticker: TICKERS.choose(&mut rng).unwrap().to_string(),
                 price: rng.random_range(100.0..1500.0),
@@ -111,7 +110,7 @@ impl TestArrowType for TickerItem {
         SCHEMA.clone()
     }
 
-    fn into_record_batch(records: Vec<Self>) -> anyhow::Result<RecordBatch>
+    fn into_record_batch(records: Vec<Self>) -> Result<RecordBatch, TestError>
     where
         Self: Sized,
     {
@@ -122,12 +121,13 @@ impl TestArrowType for TickerItem {
         let mut timestamps =
             TimestampNanosecondBuilder::with_capacity(len).with_timezone(Arc::from("UTC"));
         let mut sequences = arrow::array::UInt64Builder::with_capacity(len);
-        let mut conditions = arrow::array::ListBuilder::new(arrow::array::Int32Builder::with_capacity(len));
+        let mut conditions =
+            arrow::array::ListBuilder::new(arrow::array::Int32Builder::with_capacity(len));
         for record in records {
             let timestamp_nanos = record
                 .timestamp
                 .timestamp_nanos_opt()
-                .context("Invalid timestamp")?;
+                .ok_or_else(|| TestError::ChronoError("Timestamp out of range for nanoseconds"))?;
             tickers.append_value(&record.ticker);
             timestamps.append_value(timestamp_nanos);
             prices.append_value(record.price);
@@ -147,33 +147,48 @@ impl TestArrowType for TickerItem {
         Ok(batch)
     }
 
-    fn from_record_batch(batch: &RecordBatch) -> anyhow::Result<Vec<Self>> {
+    fn from_record_batch(batch: &RecordBatch) -> Result<Vec<Self>, TestError> {
         let ticker_array = batch
             .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
-            .context("Failed to downcast ticker column")?;
+            .ok_or_else(|| TestError::CastError {
+                from: batch.column(0).data_type().clone(),
+                to: "StringArray",
+            })?;
         let price_array = batch
             .column(1)
             .as_any()
             .downcast_ref::<arrow::array::Float64Array>()
-            .context("Failed to downcast price column")?;
-        let sequence_array = batch
+            .ok_or_else(|| TestError::CastError {
+                from: batch.column(1).data_type().clone(),
+                to: "Float64Array",
+            })?;
+        let sequence_array: &arrow::array::PrimitiveArray<arrow::datatypes::UInt64Type> = batch
             .column(2)
             .as_any()
             .downcast_ref::<arrow::array::UInt64Array>()
-            .context("Failed to downcast sequence column")?;
+            .ok_or_else(|| TestError::CastError {
+                from: batch.column(2).data_type().clone(),
+                to: "UInt64Array",
+            })?;
         let timestamp_array = batch
             .column(3)
             .as_any()
             .downcast_ref::<arrow::array::TimestampNanosecondArray>()
-            .context("Failed to downcast timestamp column")?;
+            .ok_or_else(|| TestError::CastError {
+                from: batch.column(3).data_type().clone(),
+                to: "TimestampNanosecondArray",
+            })?;
 
         let conditions_array = batch
             .column(4)
             .as_any()
             .downcast_ref::<arrow::array::ListArray>()
-            .context("Failed to downcast conditions column")?;
+            .ok_or_else(|| TestError::CastError {
+                from: batch.column(4).data_type().clone(),
+                to: "ListArray",
+            })?;
 
         let mut results = Vec::with_capacity(batch.num_rows());
         for i in 0..batch.num_rows() {
@@ -184,7 +199,10 @@ impl TestArrowType for TickerItem {
                 let int_array = value_array
                     .as_any()
                     .downcast_ref::<arrow::array::Int32Array>()
-                    .context("Failed to downcast conditions value array")?;
+                    .ok_or_else(|| TestError::CastError {
+                        from: value_array.data_type().clone(),
+                        to: "Int32Array",
+                    })?;
                 (0..int_array.len()).map(|j| int_array.value(j)).collect()
             };
             results.push(Self {
@@ -192,7 +210,7 @@ impl TestArrowType for TickerItem {
                 price: price_array.value(i),
                 sequence: sequence_array.value(i),
                 timestamp: datetime,
-                conditions: conditions_values
+                conditions: conditions_values,
             });
         }
         Ok(results)
@@ -215,7 +233,7 @@ mod tests {
         let sorting_columns = TickerItem::sorting_columns();
 
         let sorted = crate::sorting::sort_record_batch(&batch, &sorting_columns).unwrap();
-        arrow::util::pretty::print_batches(&[sorted.clone()]).unwrap();
+        arrow::util::pretty::print_batches(std::slice::from_ref(&sorted)).unwrap();
 
         let items_back = TickerItem::from_record_batch(&sorted).unwrap();
         assert_eq!(items_back.len(), 100);

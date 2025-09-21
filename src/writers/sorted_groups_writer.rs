@@ -53,9 +53,8 @@ impl SortedGroupsParquetWriter {
                 ),
             ));
         }
-        let results = self
-            .buffer
-            .add_batch(sorting::sort_record_batch(batch, self.sorting_columns()?)?);
+        let sorted_batch = sorting::sort_record_batch(batch, self.sorting_columns()?)?;
+        let results = self.buffer.add_batch(sorted_batch);
         if let Some(batches_to_write) = results {
             let sorted_batch =
                 record_batch::merge_sorted_batches(&batches_to_write, self.sorting_columns()?)?;

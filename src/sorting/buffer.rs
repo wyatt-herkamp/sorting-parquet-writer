@@ -3,7 +3,7 @@ use std::mem;
 use arrow::array::RecordBatch;
 
 use crate::utils::split_batch;
-
+#[derive(Debug, Clone, PartialEq)]
 pub struct SortingBuffer {
     buffer: Vec<RecordBatch>,
     num_rows: usize,
@@ -29,19 +29,20 @@ impl SortingBuffer {
             let mut replaced = mem::replace(&mut self.buffer, vec![remaining_batch]);
             self.num_rows = remaining_batch_num_rows;
             replaced.push(new_batch);
-            Some(replaced)
-        } else {
-            self.buffer.push(batch);
-            self.num_rows = new_total_rows;
-            None
+
+            return Some(replaced);
         }
+        self.buffer.push(batch);
+        self.num_rows = new_total_rows;
+        None
     }
 
+    /// Flushes the current buffer, returning all buffered RecordBatches and clearing the buffer.
     pub fn flush(&mut self) -> Option<Vec<RecordBatch>> {
         if self.buffer.is_empty() {
             None
         } else {
-            let replaced = mem::replace(&mut self.buffer, Vec::new());
+            let replaced = mem::take(&mut self.buffer);
             self.num_rows = 0;
             Some(replaced)
         }

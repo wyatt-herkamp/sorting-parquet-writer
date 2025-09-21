@@ -4,14 +4,13 @@ use arrow_row::{RowConverter, SortField};
 use parquet::format::SortingColumn;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::sync::Arc;
 
 use crate::SortingParquetError;
-use crate::record_batch::build::{
+use crate::record_batch::merge_type::{
     MergableDataType, TimestampMicrosecond, TimestampMillisecond, TimestampNanosecond,
     TimestampSecond,
 };
-mod build;
+mod merge_type;
 #[derive(Eq)]
 struct HeapItem<'a> {
     batch_idx: usize,
@@ -130,67 +129,51 @@ fn from_field(
 ) -> Result<ArrayRef, SortingParquetError> {
     match field.data_type() {
         DataType::Boolean => {
-            return <bool as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
+            <bool as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
         }
-        DataType::Int8 => {
-            return <i8 as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
-        }
-        DataType::Int16 => {
-            return <i16 as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
-        }
-        DataType::Int32 => {
-            return <i32 as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
-        }
-        DataType::Int64 => {
-            return <i64 as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
-        }
-        DataType::UInt8 => {
-            return <u8 as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
-        }
+        DataType::Int8 => <i8 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &()),
+        DataType::Int16 => <i16 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &()),
+        DataType::Int32 => <i32 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &()),
+        DataType::Int64 => <i64 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &()),
+        DataType::UInt8 => <u8 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &()),
         DataType::UInt16 => {
-            return <u16 as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
+            <u16 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
         }
         DataType::UInt32 => {
-            return <u32 as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
+            <u32 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
         }
         DataType::UInt64 => {
-            return <u64 as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
+            <u64 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
         }
         DataType::Float32 => {
-            return <f32 as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
+            <f32 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
         }
         DataType::Float64 => {
-            return <f64 as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
+            <f64 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
         }
         DataType::Utf8 => {
-            return <String as MergableDataType<usize>>::merge(col_idx, &merge_order, batches, &10);
+            <String as MergableDataType<usize>>::merge(col_idx, merge_order, batches, &10)
         }
-        DataType::Timestamp(unit, tz) => {
-            return match unit {
-                arrow::datatypes::TimeUnit::Second => {
-                    TimestampSecond::merge(col_idx, &merge_order, batches, tz)
-                }
-                arrow::datatypes::TimeUnit::Millisecond => {
-                    TimestampMillisecond::merge(col_idx, &merge_order, batches, tz)
-                }
-                arrow::datatypes::TimeUnit::Microsecond => {
-                    TimestampMicrosecond::merge(col_idx, &merge_order, batches, tz)
-                }
-                arrow::datatypes::TimeUnit::Nanosecond => {
-                    TimestampNanosecond::merge(col_idx, &merge_order, batches, tz)
-                }
-            };
-        }
+        DataType::Timestamp(unit, tz) => match unit {
+            arrow::datatypes::TimeUnit::Second => {
+                TimestampSecond::merge(col_idx, merge_order, batches, tz)
+            }
+            arrow::datatypes::TimeUnit::Millisecond => {
+                TimestampMillisecond::merge(col_idx, merge_order, batches, tz)
+            }
+            arrow::datatypes::TimeUnit::Microsecond => {
+                TimestampMicrosecond::merge(col_idx, merge_order, batches, tz)
+            }
+            arrow::datatypes::TimeUnit::Nanosecond => {
+                TimestampNanosecond::merge(col_idx, merge_order, batches, tz)
+            }
+        },
         DataType::List(data_type) => {
             from_list_field(data_type.as_ref(), col_idx, merge_order, batches)
         }
-        dt => {
-            return Err(arrow::error::ArrowError::InvalidArgumentError(format!(
-                "Unsupported data type for merge: {:?}",
-                dt
-            ))
-            .into());
-        }
+        dt => Err(SortingParquetError::UnsupportedDataTypeForMerge(
+            dt.to_string(),
+        )),
     }
 }
 
@@ -202,74 +185,68 @@ fn from_list_field(
 ) -> Result<ArrayRef, SortingParquetError> {
     match field.data_type() {
         DataType::Boolean => {
-            return <Vec<bool> as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
+            <Vec<bool> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
         }
         DataType::Int8 => {
-            return <Vec<i8> as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
+            <Vec<i8> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
         }
         DataType::Int16 => {
-            return <Vec<i16> as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
+            <Vec<i16> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
         }
         DataType::Int32 => {
-            return <Vec<i32> as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
+            <Vec<i32> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
         }
         DataType::Int64 => {
-            return <Vec<i64> as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
+            <Vec<i64> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
         }
         DataType::UInt8 => {
-            return <Vec<u8> as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
+            <Vec<u8> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
         }
         DataType::UInt16 => {
-            return <Vec<u16> as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
+            <Vec<u16> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
         }
         DataType::UInt32 => {
-            return <Vec<u32> as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
+            <Vec<u32> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
         }
         DataType::UInt64 => {
-            return <Vec<u64> as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
+            <Vec<u64> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
         }
         DataType::Float32 => {
-            return <Vec<f32> as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
+            <Vec<f32> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
         }
         DataType::Float64 => {
-            return <Vec<f64> as MergableDataType<()>>::merge(col_idx, &merge_order, batches, &());
+            <Vec<f64> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
         }
         DataType::Utf8 => {
-            return <Vec<String> as MergableDataType<usize>>::merge(col_idx, &merge_order, batches, &10);
+            <Vec<String> as MergableDataType<usize>>::merge(col_idx, merge_order, batches, &10)
         }
-        DataType::Timestamp(unit, tz) => {
-            return match unit {
-                arrow::datatypes::TimeUnit::Second => {
-                    Vec::<TimestampSecond>::merge(col_idx, &merge_order, batches, tz)
-                }
-                arrow::datatypes::TimeUnit::Millisecond => {
-                    Vec::<TimestampMillisecond>::merge(col_idx, &merge_order, batches, tz)
-                }
-                arrow::datatypes::TimeUnit::Microsecond => {
-                    Vec::<TimestampMicrosecond>::merge(col_idx, &merge_order, batches, tz)
-                }
-                arrow::datatypes::TimeUnit::Nanosecond => {
-                    Vec::<TimestampNanosecond>::merge(col_idx, &merge_order, batches, tz)
-                }
-            };
-        }
+        DataType::Timestamp(unit, tz) => match unit {
+            arrow::datatypes::TimeUnit::Second => {
+                Vec::<TimestampSecond>::merge(col_idx, merge_order, batches, tz)
+            }
+            arrow::datatypes::TimeUnit::Millisecond => {
+                Vec::<TimestampMillisecond>::merge(col_idx, merge_order, batches, tz)
+            }
+            arrow::datatypes::TimeUnit::Microsecond => {
+                Vec::<TimestampMicrosecond>::merge(col_idx, merge_order, batches, tz)
+            }
+            arrow::datatypes::TimeUnit::Nanosecond => {
+                Vec::<TimestampNanosecond>::merge(col_idx, merge_order, batches, tz)
+            }
+        },
         DataType::List(data_type) => {
             from_list_field(data_type.as_ref(), col_idx, merge_order, batches)
         }
-        dt => {
-            return Err(arrow::error::ArrowError::InvalidArgumentError(format!(
-                "Unsupported data type for merge: {:?}",
-                dt
-            ))
-            .into());
-        }
+        dt => Err(SortingParquetError::UnsupportedDataTypeForMerge(
+            dt.to_string(),
+        )),
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::{
-        array::{Int32Array, RecordBatch, StringArray},
+        array::{Int32Array, RecordBatch, StringArray, record_batch},
         datatypes::{DataType, Field, Schema},
     };
     use parquet::format::SortingColumn;
@@ -307,7 +284,7 @@ mod tests {
             nulls_first: false,
         }];
         let merged = merge_sorted_batches(&[batch1, batch2], &sorting_columns).unwrap();
-        arrow::util::pretty::print_batches(&[merged.clone()]).unwrap();
+        arrow::util::pretty::print_batches(std::slice::from_ref(&merged)).unwrap();
         let a = merged
             .column(0)
             .as_any()
@@ -324,5 +301,85 @@ mod tests {
         assert_eq!(b.value(1), "b");
         assert_eq!(b.value(2), "c");
         assert_eq!(b.value(3), "d");
+    }
+
+    #[test]
+    fn test_different_sizes() {
+        let batch_a =
+            record_batch!(("id", Int32, [1, 3]), ("name", Utf8, ["wyatt", "evan"])).unwrap();
+
+        let batch_b = record_batch!(
+            ("id", Int32, [2, 4, 6]),
+            ("name", Utf8, ["alice", "bob", "david"])
+        )
+        .unwrap();
+
+        let sorting_columns = vec![SortingColumn {
+            column_idx: 0,
+            descending: false,
+            nulls_first: false,
+        }];
+        let merged = merge_sorted_batches(&[batch_a, batch_b], &sorting_columns).unwrap();
+        arrow::util::pretty::print_batches(std::slice::from_ref(&merged)).unwrap();
+
+        let a = merged
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let b = merged
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(a.values(), &[1, 2, 3, 4, 6]);
+        assert_eq!(b.value(0), "wyatt");
+        assert_eq!(b.value(1), "alice");
+        assert_eq!(b.value(2), "evan");
+        assert_eq!(b.value(3), "bob");
+        assert_eq!(b.value(4), "david");
+    }
+
+    #[test]
+    fn merge_with_null() {
+        let batch_a = record_batch!(
+            ("id", Int32, [1, 3, 5]),
+            ("name", Utf8, [Some("wyatt"), Some("evan"), None])
+        )
+        .unwrap();
+
+        let batch_b = record_batch!(
+            ("id", Int32, [2, 4, 6]),
+            ("name", Utf8, ["alice", "bob", "david"])
+        )
+        .unwrap();
+
+        let sorting_columns = vec![SortingColumn {
+            column_idx: 0,
+            descending: false,
+            nulls_first: false,
+        }];
+        let merged = merge_sorted_batches(&[batch_a, batch_b], &sorting_columns).unwrap();
+        arrow::util::pretty::print_batches(std::slice::from_ref(&merged)).unwrap();
+
+        let a = merged
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let b = merged
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(a.values(), &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(b.value(0), "wyatt");
+        assert_eq!(b.value(1), "alice");
+        assert_eq!(b.value(2), "evan");
+        assert_eq!(b.value(3), "bob");
+        assert!(b.value(4).is_empty());
+        assert_eq!(b.value(5), "david");
     }
 }

@@ -6,10 +6,13 @@ description = "A Rust Implementation of Parquet-Go's SortingWriter"
 license = "Apache-2.0 OR MIT"
 [dependencies]
 arrow = {version = "56", features = ["chrono-tz"]}
+arrow-schema = "56"
 arrow-row = "56"
 parquet = "56"
 thiserror = "2"
 
+[features]
+tests = []
 
 [dev-dependencies]
 chrono = "0.4"
@@ -18,3 +21,4 @@ rand = "0.9"
 anyhow = "1"
 arrow = {version = "56", features = ["prettyprint"]}
 humantime = "2"
+criterion = "0.7"

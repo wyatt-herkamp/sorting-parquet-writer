@@ -4,7 +4,6 @@ use arrow::compute::{SortOptions, take};
 use arrow_row::{RowConverter, SortField};
 use parquet::format::SortingColumn;
 pub mod buffer;
-pub mod row_group;
 /// Sorts a RecordBatch based on the provided sorting columns.
 ///
 /// Using [arrow_row](https://crates.io/crates/arrow_row) to convert rows into a comparable format,
