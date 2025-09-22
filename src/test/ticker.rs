@@ -219,11 +219,11 @@ impl TestArrowType for TickerItem {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{path::PathBuf, time::Duration};
 
-    use parquet::arrow::ArrowWriter;
+    use parquet::arrow::{ArrowWriter, arrow_reader::{ArrowReaderBuilder, ArrowReaderOptions}};
 
-    use crate::writers::SortedGroupsParquetWriter;
+    use crate::writers::{SortedGroupsParquetWriter, SortingParquetWriter};
 
     use super::*;
     #[test]
@@ -305,13 +305,14 @@ mod tests {
     }
     #[test]
     fn create_test_sorted() -> anyhow::Result<()> {
-        let file = std::fs::File::create("test_output.parquet")?;
+        let path = PathBuf::from("test_output.sorted.parquet");
+        let file = std::fs::File::create(&path)?;
         let props = parquet::file::properties::WriterProperties::builder()
             .set_sorting_columns(Some(TickerItem::sorting_columns()))
             .build();
         let schema = TickerItem::schema();
-        let mut sorted_writer: SortedGroupsParquetWriter =
-            SortedGroupsParquetWriter::try_new(file, schema, props)?;
+        let mut sorted_writer: SortingParquetWriter =
+            SortingParquetWriter::try_new(file, schema, props)?;
         let mut duration_sum_sorted = Duration::ZERO;
 
         for i in 0..50 {
@@ -324,11 +325,22 @@ mod tests {
                 duration_sum_sorted += start.elapsed();
             }
         }
-        sorted_writer.close()?;
+        sorted_writer.finish()?;
         println!(
             "Total sorted write time: {}",
             humantime::format_duration(duration_sum_sorted)
         );
+
+        let mut reader = ArrowReaderBuilder::try_new_with_options(
+            std::fs::File::open(&path)?,
+            ArrowReaderOptions::new().with_schema(TickerItem::schema())
+        ).unwrap().with_batch_size(200).build()?;
+        while let Some(batch) = reader.next(){
+            let batch = batch?;
+            let items_back = TickerItem::from_record_batch(&batch)?;
+            assert_eq!(items_back.len(), batch.num_rows());
+            assert_eq!(TickerItem::is_sorted(&items_back), None);
+        }
         Ok(())
     }
 }

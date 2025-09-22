@@ -11,6 +11,7 @@ arrow-row = "56"
 parquet = "56"
 thiserror = "2"
 
+tempfile = "3"
 [features]
 tests = []
 

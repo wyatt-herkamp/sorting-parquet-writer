@@ -14,6 +14,9 @@ pub enum SortingParquetError {
 
     #[error("Unsupported DataType for Merging: {0}")]
     UnsupportedDataTypeForMerge(String),
+
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
 }
 
 #[derive(Debug, Error)]

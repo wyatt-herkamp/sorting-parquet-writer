@@ -1,7 +1,7 @@
 mod error;
 pub use error::*;
 pub mod record_batch;
-mod sorting;
+pub mod sorting;
 #[cfg(test)]
 pub mod test;
 mod utils;

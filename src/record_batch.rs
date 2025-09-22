@@ -121,7 +121,7 @@ pub fn merge_sorted_batches(
     let merged = RecordBatch::try_new(schema, final_columns)?;
     Ok(merged)
 }
-fn from_field(
+pub fn from_field(
     field: &Field,
     col_idx: usize,
     merge_order: &[(usize, u32)],
