@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::Write;
+use std::mem;
 use std::rc::Rc;
 
 use arrow::array::RecordBatch;
@@ -29,7 +30,7 @@ pub struct SortingParquetWriter<W: Write + Send> {
     schema: SchemaRef,
     properties: WriterProperties,
     target: ArrowWriter<W>,
-    row_converter: arrow_row::RowConverter,
+    row_converter: Option<arrow_row::RowConverter>,
     // In-memory buffer
     buffer: Vec<RecordBatch>,
     buffered_rows: usize,
@@ -76,7 +77,7 @@ impl<W: Write + Send> SortingParquetWriter<W> {
             schema,
             properties,
             target,
-            row_converter,
+            row_converter: Some(row_converter),
             buffer: Vec::new(),
             buffered_rows: 0,
             max_memory_rows,
@@ -121,7 +122,9 @@ impl<W: Write + Send> SortingParquetWriter<W> {
             crate::sorting::sort_record_batch_with_row_converter_returning_extremes(
                 &combined,
                 &sorting_columns,
-                &self.row_converter,
+                self.row_converter
+                    .as_ref()
+                    .ok_or(SortingParquetError::WriterClosed)?,
             )?;
         drop(combined);
 
@@ -158,7 +161,7 @@ impl<W: Write + Send> SortingParquetWriter<W> {
 
     /// Finishes writing, performing the final merge of all sorted runs
     /// and producing the globally sorted output file.
-    pub fn finish(mut self) -> Result<(), SortingParquetError> {
+    pub fn finish(&mut self) -> Result<(), SortingParquetError> {
         let sorting_columns = self
             .properties
             .sorting_columns()
@@ -168,7 +171,7 @@ impl<W: Write + Send> SortingParquetWriter<W> {
         // Flush any remaining buffered data to a run
         self.flush_to_run()?;
 
-        let mut target = self.target;
+        let target = &mut self.target;
         let output_batch_size = self
             .properties
             .max_row_group_row_count()
@@ -177,7 +180,7 @@ impl<W: Write + Send> SortingParquetWriter<W> {
         match self.run_files.len() {
             0 => {
                 // No data written at all
-                target.close()?;
+                target.finish()?;
             }
             1 => {
                 // Single run — already fully sorted, just copy through
@@ -189,15 +192,17 @@ impl<W: Write + Send> SortingParquetWriter<W> {
                     target.write(&batch?)?;
                     target.flush()?;
                 }
-                target.close()?;
+                target.finish()?;
             }
             _ => {
                 // Multiple runs — streaming k-way merge
 
                 let merger = SortedRunMerger::try_new(
-                    self.run_files,
+                    mem::take(&mut self.run_files),
                     sorting_columns,
-                    self.row_converter,
+                    self.row_converter
+                        .take()
+                        .expect("RowConverter should be set if we have sorting columns"),
                     output_batch_size,
                 )?;
 
@@ -205,12 +210,15 @@ impl<W: Write + Send> SortingParquetWriter<W> {
                     target.write(&batch_result?)?;
                     target.flush()?;
                 }
-                target.close()?;
+                target.finish()?;
             }
         }
 
         // temp_dir drops here, cleaning up all run files automatically
         Ok(())
+    }
+    pub fn inner_mut(&mut self) -> &mut W {
+        self.target.inner_mut()
     }
 }
 

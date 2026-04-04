@@ -8,7 +8,8 @@ pub enum SortingParquetError {
     ParquetError(#[from] parquet::errors::ParquetError),
     #[error("No Sorting Columns Configured")]
     NoSortingColumnsConfigured,
-
+    #[error("Writer is already closed")]
+    WriterClosed,
     #[error(transparent)]
     IoError(#[from] std::io::Error),
 }
