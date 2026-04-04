@@ -2,7 +2,7 @@ use arrow::array::ArrayRef;
 use arrow::array::RecordBatch;
 use arrow::compute::{SortOptions, take};
 use arrow_row::{RowConverter, SortField};
-use parquet::format::SortingColumn;
+use parquet::file::metadata::SortingColumn;
 pub mod buffer;
 /// Sorts a RecordBatch based on the provided sorting columns.
 ///
@@ -12,6 +12,13 @@ pub fn sort_record_batch(
     sorting_columns: &[SortingColumn],
 ) -> Result<RecordBatch, arrow::error::ArrowError> {
     let schema = batch.schema();
+    let row_converter = create_row_converter(sorting_columns, schema.as_ref())?;
+    sort_record_batch_with_row_converter(batch, sorting_columns, &row_converter)
+}
+pub fn create_row_converter(
+    sorting_columns: &[SortingColumn],
+    schema: &arrow::datatypes::Schema,
+) -> Result<RowConverter, arrow::error::ArrowError> {
     let mut sort_fields = Vec::with_capacity(sorting_columns.len());
     for col in sorting_columns {
         let field = schema.field(col.column_idx as usize);
@@ -24,19 +31,25 @@ pub fn sort_record_batch(
         );
         sort_fields.push(sort_field);
     }
-    let row_converter = RowConverter::new(sort_fields)?;
+    RowConverter::new(sort_fields)
+}
+pub fn sort_record_batch_with_row_converter(
+    batch: &RecordBatch,
+    sorting_columns: &[SortingColumn],
+    row_converter: &RowConverter,
+) -> Result<RecordBatch, arrow::error::ArrowError> {
     let columns: Vec<ArrayRef> = sorting_columns
         .iter()
         .map(|col| batch.column(col.column_idx as usize).clone())
         .collect();
     let rows = row_converter.convert_columns(&columns)?;
-    let mut indices: Vec<usize> = (0..batch.num_rows()).collect();
-    indices.sort_by(|&a, &b| {
-        let row_a = rows.row(a);
-        let row_b = rows.row(b);
+    let mut indices: Vec<u32> = (0..batch.num_rows() as u32).collect();
+    indices.sort_by(|&a, &b| unsafe {
+        let row_a = rows.row_unchecked(a as usize);
+        let row_b = rows.row_unchecked(b as usize);
         row_a.cmp(&row_b)
     });
-    let indices_array = arrow::array::UInt32Array::from_iter(indices.iter().map(|&i| i as u32));
+    let indices_array = arrow::array::UInt32Array::from_iter(indices);
     // Use arrow::compute::take on each column to build the sorted batch
     let sorted_columns: Vec<ArrayRef> = (0..batch.num_columns())
         .map(|i| take(batch.column(i).as_ref(), &indices_array, None))
@@ -54,7 +67,7 @@ mod tests {
         array::{Int32Array, RecordBatch, StringArray},
         datatypes::{DataType, Field, Schema},
     };
-    use parquet::format::SortingColumn;
+    use parquet::file::metadata::SortingColumn;
     #[test]
     fn test_sort_record_batch() {
         let batch = RecordBatch::try_new(

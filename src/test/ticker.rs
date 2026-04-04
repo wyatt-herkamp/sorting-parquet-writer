@@ -50,22 +50,22 @@ impl TestArrowType for TickerItem {
         }
         results
     }
-    fn sorting_columns() -> Vec<parquet::format::SortingColumn>
+    fn sorting_columns() -> Vec<parquet::file::metadata::SortingColumn>
     where
         Self: Sized,
     {
         vec![
-            parquet::format::SortingColumn {
+            parquet::file::metadata::SortingColumn {
                 column_idx: 0,
                 descending: false,
                 nulls_first: false,
             },
-            parquet::format::SortingColumn {
+            parquet::file::metadata::SortingColumn {
                 column_idx: 3,
                 descending: false,
                 nulls_first: false,
             },
-            parquet::format::SortingColumn {
+            parquet::file::metadata::SortingColumn {
                 column_idx: 2,
                 descending: false,
                 nulls_first: false,
@@ -219,13 +219,14 @@ impl TestArrowType for TickerItem {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::Duration};
+    use std::time::Duration;
 
-    use parquet::arrow::{ArrowWriter, arrow_reader::{ArrowReaderBuilder, ArrowReaderOptions}};
+    use parquet::arrow::arrow_reader::{ArrowReaderBuilder, ArrowReaderOptions};
 
-    use crate::writers::{SortedGroupsParquetWriter, SortingParquetWriter};
+    use crate::{test::get_test_dir, writers::SortingParquetWriter};
 
     use super::*;
+
     #[test]
     fn test_random_ticker_item() {
         let item = TickerItem::random_instances(100);
@@ -266,46 +267,8 @@ mod tests {
     }
 
     #[test]
-    fn create_test_files() -> anyhow::Result<()> {
-        let file = std::fs::File::create("test_output.sorted.parquet")?;
-        let unsorted_file = std::fs::File::create("test_output.unsorted.parquet")?;
-        let props = parquet::file::properties::WriterProperties::builder()
-            .set_sorting_columns(Some(TickerItem::sorting_columns()))
-            .build();
-        let schema = TickerItem::schema();
-        let mut sorted_writer = SortedGroupsParquetWriter::try_new(file, schema, props)?;
-        let mut unsorted_writer = ArrowWriter::try_new(unsorted_file, TickerItem::schema(), None)?;
-        let mut duration_sum_sorted = Duration::ZERO;
-        let mut duration_sum_unsorted = Duration::ZERO;
-
-        for i in 0..200 {
-            eprintln!("Writing batch {}/200", i + 1);
-            let items = TickerItem::random_instances(1024 * 1024);
-            for chunk in items.chunks(128) {
-                let batch = TickerItem::into_record_batch(chunk.to_vec())?;
-                let start = std::time::Instant::now();
-                sorted_writer.write(&batch)?;
-                duration_sum_sorted += start.elapsed();
-                let start = std::time::Instant::now();
-                unsorted_writer.write(&batch)?;
-                duration_sum_unsorted += start.elapsed();
-            }
-        }
-        sorted_writer.close()?;
-        unsorted_writer.close()?;
-        println!(
-            "Total sorted write time: {}",
-            humantime::format_duration(duration_sum_sorted)
-        );
-        println!(
-            "Total unsorted write time: {}",
-            humantime::format_duration(duration_sum_unsorted)
-        );
-        Ok(())
-    }
-    #[test]
     fn create_test_sorted() -> anyhow::Result<()> {
-        let path = PathBuf::from("test_output.sorted.parquet");
+        let path = get_test_dir().join("test_output.sorted.parquet");
         let file = std::fs::File::create(&path)?;
         let props = parquet::file::properties::WriterProperties::builder()
             .set_sorting_columns(Some(TickerItem::sorting_columns()))
@@ -333,9 +296,12 @@ mod tests {
 
         let mut reader = ArrowReaderBuilder::try_new_with_options(
             std::fs::File::open(&path)?,
-            ArrowReaderOptions::new().with_schema(TickerItem::schema())
-        ).unwrap().with_batch_size(200).build()?;
-        while let Some(batch) = reader.next(){
+            ArrowReaderOptions::new().with_schema(TickerItem::schema()),
+        )
+        .unwrap()
+        .with_batch_size(200)
+        .build()?;
+        while let Some(batch) = reader.next() {
             let batch = batch?;
             let items_back = TickerItem::from_record_batch(&batch)?;
             assert_eq!(items_back.len(), batch.num_rows());

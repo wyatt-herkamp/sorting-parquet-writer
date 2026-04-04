@@ -3,7 +3,7 @@ use parquet::arrow::ArrowWriter;
 use crate::test::{TestArrowType, TickerItem};
 fn base_dir() -> std::path::PathBuf {
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest.join("test_data")
+    manifest.join("test_output")
 }
 #[test]
 #[ignore]

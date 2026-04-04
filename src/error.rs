@@ -10,12 +10,6 @@ pub enum SortingParquetError {
     NoSortingColumnsConfigured,
 
     #[error(transparent)]
-    CastError(#[from] CastError),
-
-    #[error("Unsupported DataType for Merging: {0}")]
-    UnsupportedDataTypeForMerge(String),
-
-    #[error(transparent)]
     IoError(#[from] std::io::Error),
 }
 

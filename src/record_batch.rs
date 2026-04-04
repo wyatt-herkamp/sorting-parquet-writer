@@ -1,16 +1,12 @@
 use arrow::array::{ArrayRef, RecordBatch};
-use arrow::datatypes::{DataType, Field};
+use arrow::compute::interleave_record_batch;
 use arrow_row::{RowConverter, SortField};
-use parquet::format::SortingColumn;
+use parquet::file::metadata::SortingColumn;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use crate::SortingParquetError;
-use crate::record_batch::merge_type::{
-    MergableDataType, TimestampMicrosecond, TimestampMillisecond, TimestampNanosecond,
-    TimestampSecond,
-};
-mod merge_type;
+pub mod streaming_merge;
 #[derive(Eq)]
 struct HeapItem<'a> {
     batch_idx: usize,
@@ -68,6 +64,36 @@ pub fn merge_sorted_batches(
     }
     let row_converter = RowConverter::new(sort_fields)?;
 
+    merge_sorted_batches_with_row_converter(batches, sorting_columns, &row_converter)
+}
+pub fn merge_sorted_batches_with_row_converter(
+    batches: &[RecordBatch],
+    sorting_columns: &[SortingColumn],
+    row_converter: &RowConverter,
+) -> Result<RecordBatch, SortingParquetError> {
+    if batches.is_empty() {
+        return Err(arrow::error::ArrowError::InvalidArgumentError(
+            "No batches to merge".to_string(),
+        )
+        .into());
+    }
+    let schema = batches[0].schema();
+    for batch in batches {
+        if !batch.schema().as_ref().eq(schema.as_ref()) {
+            return Err(arrow::error::ArrowError::InvalidArgumentError(
+                "All batches must have the same schema".to_string(),
+            )
+            .into());
+        }
+    }
+
+    merge_sorted_batches_with_row_converter_unchecked(batches, sorting_columns, row_converter)
+}
+pub fn merge_sorted_batches_with_row_converter_unchecked(
+    batches: &[RecordBatch],
+    sorting_columns: &[SortingColumn],
+    row_converter: &RowConverter,
+) -> Result<RecordBatch, SortingParquetError> {
     // For each batch, convert the sort columns to rows
     let mut row_columns = Vec::with_capacity(batches.len());
     let mut total_rows = 0;
@@ -81,8 +107,7 @@ pub fn merge_sorted_batches(
         row_columns.push(rows);
     }
 
-    let mut heap = BinaryHeap::with_capacity(total_rows);
-    let mut total_rows = 0;
+    let mut heap = BinaryHeap::with_capacity(batches.len());
     for (batch_idx, batch) in batches.iter().enumerate() {
         if batch.num_rows() > 0 {
             heap.push(HeapItem {
@@ -90,17 +115,16 @@ pub fn merge_sorted_batches(
                 row_idx: 0,
                 row: row_columns[batch_idx].row(0),
             });
-            total_rows += batch.num_rows();
         }
     }
 
-    let mut merge_order: Vec<(usize, u32)> = Vec::with_capacity(total_rows);
+    let mut merge_order: Vec<(usize, usize)> = Vec::with_capacity(total_rows);
 
     while let Some(HeapItem {
         batch_idx, row_idx, ..
     }) = heap.pop()
     {
-        merge_order.push((batch_idx, row_idx as u32));
+        merge_order.push((batch_idx, row_idx));
         let next_row_idx = row_idx + 1;
         if next_row_idx < batches[batch_idx].num_rows() {
             heap.push(HeapItem {
@@ -110,137 +134,10 @@ pub fn merge_sorted_batches(
             });
         }
     }
-    // Build final columns by taking rows in merge order
-    let mut final_columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-    for col_idx in 0..schema.fields().len() {
-        // Build arrays based on data type
-        let field = schema.field(col_idx);
-        let array = from_field(field, col_idx, &merge_order, batches)?;
-        final_columns.push(array);
-    }
-    let merged = RecordBatch::try_new(schema, final_columns)?;
-    Ok(merged)
-}
-pub fn from_field(
-    field: &Field,
-    col_idx: usize,
-    merge_order: &[(usize, u32)],
-    batches: &[RecordBatch],
-) -> Result<ArrayRef, SortingParquetError> {
-    match field.data_type() {
-        DataType::Boolean => {
-            <bool as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
-        }
-        DataType::Int8 => <i8 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &()),
-        DataType::Int16 => <i16 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &()),
-        DataType::Int32 => <i32 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &()),
-        DataType::Int64 => <i64 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &()),
-        DataType::UInt8 => <u8 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &()),
-        DataType::UInt16 => {
-            <u16 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
-        }
-        DataType::UInt32 => {
-            <u32 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
-        }
-        DataType::UInt64 => {
-            <u64 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
-        }
-        DataType::Float32 => {
-            <f32 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
-        }
-        DataType::Float64 => {
-            <f64 as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
-        }
-        DataType::Utf8 => {
-            <String as MergableDataType<usize>>::merge(col_idx, merge_order, batches, &10)
-        }
-        DataType::Timestamp(unit, tz) => match unit {
-            arrow::datatypes::TimeUnit::Second => {
-                TimestampSecond::merge(col_idx, merge_order, batches, tz)
-            }
-            arrow::datatypes::TimeUnit::Millisecond => {
-                TimestampMillisecond::merge(col_idx, merge_order, batches, tz)
-            }
-            arrow::datatypes::TimeUnit::Microsecond => {
-                TimestampMicrosecond::merge(col_idx, merge_order, batches, tz)
-            }
-            arrow::datatypes::TimeUnit::Nanosecond => {
-                TimestampNanosecond::merge(col_idx, merge_order, batches, tz)
-            }
-        },
-        DataType::List(data_type) => {
-            from_list_field(data_type.as_ref(), col_idx, merge_order, batches)
-        }
-        dt => Err(SortingParquetError::UnsupportedDataTypeForMerge(
-            dt.to_string(),
-        )),
-    }
-}
 
-fn from_list_field(
-    field: &Field,
-    col_idx: usize,
-    merge_order: &[(usize, u32)],
-    batches: &[RecordBatch],
-) -> Result<ArrayRef, SortingParquetError> {
-    match field.data_type() {
-        DataType::Boolean => {
-            <Vec<bool> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
-        }
-        DataType::Int8 => {
-            <Vec<i8> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
-        }
-        DataType::Int16 => {
-            <Vec<i16> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
-        }
-        DataType::Int32 => {
-            <Vec<i32> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
-        }
-        DataType::Int64 => {
-            <Vec<i64> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
-        }
-        DataType::UInt8 => {
-            <Vec<u8> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
-        }
-        DataType::UInt16 => {
-            <Vec<u16> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
-        }
-        DataType::UInt32 => {
-            <Vec<u32> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
-        }
-        DataType::UInt64 => {
-            <Vec<u64> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
-        }
-        DataType::Float32 => {
-            <Vec<f32> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
-        }
-        DataType::Float64 => {
-            <Vec<f64> as MergableDataType<()>>::merge(col_idx, merge_order, batches, &())
-        }
-        DataType::Utf8 => {
-            <Vec<String> as MergableDataType<usize>>::merge(col_idx, merge_order, batches, &10)
-        }
-        DataType::Timestamp(unit, tz) => match unit {
-            arrow::datatypes::TimeUnit::Second => {
-                Vec::<TimestampSecond>::merge(col_idx, merge_order, batches, tz)
-            }
-            arrow::datatypes::TimeUnit::Millisecond => {
-                Vec::<TimestampMillisecond>::merge(col_idx, merge_order, batches, tz)
-            }
-            arrow::datatypes::TimeUnit::Microsecond => {
-                Vec::<TimestampMicrosecond>::merge(col_idx, merge_order, batches, tz)
-            }
-            arrow::datatypes::TimeUnit::Nanosecond => {
-                Vec::<TimestampNanosecond>::merge(col_idx, merge_order, batches, tz)
-            }
-        },
-        DataType::List(data_type) => {
-            from_list_field(data_type.as_ref(), col_idx, merge_order, batches)
-        }
-        dt => Err(SortingParquetError::UnsupportedDataTypeForMerge(
-            dt.to_string(),
-        )),
-    }
+    let batch_refs: Vec<&RecordBatch> = batches.iter().collect();
+    let merged = interleave_record_batch(&batch_refs, &merge_order)?;
+    Ok(merged)
 }
 #[cfg(test)]
 mod tests {
@@ -249,7 +146,7 @@ mod tests {
         array::{Int32Array, RecordBatch, StringArray, record_batch},
         datatypes::{DataType, Field, Schema},
     };
-    use parquet::format::SortingColumn;
+    use parquet::file::metadata::SortingColumn;
     use std::sync::Arc;
 
     #[test]

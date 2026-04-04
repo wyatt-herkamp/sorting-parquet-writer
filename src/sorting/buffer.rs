@@ -24,7 +24,8 @@ impl SortingBuffer {
         let new_total_rows = self.num_rows + batch.num_rows();
         if new_total_rows >= self.maximum_rows_per_group {
             let excess_rows = new_total_rows - self.maximum_rows_per_group;
-            let (new_batch, remaining_batch) = split_batch(&batch, excess_rows);
+            let rows_to_take = batch.num_rows() - excess_rows;
+            let (new_batch, remaining_batch) = split_batch(&batch, rows_to_take);
             let remaining_batch_num_rows = remaining_batch.num_rows();
             let mut replaced = mem::replace(&mut self.buffer, vec![remaining_batch]);
             self.num_rows = remaining_batch_num_rows;

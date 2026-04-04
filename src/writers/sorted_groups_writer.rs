@@ -7,6 +7,10 @@ use crate::{
     SortingParquetError, record_batch,
     sorting::{self, buffer::SortingBuffer},
 };
+
+/// Default maximum row group size when not explicitly configured (matches parquet 56 behavior).
+const DEFAULT_MAX_ROW_GROUP_SIZE: usize = 1024 * 1024;
+
 /// A Parquet Writer that sorts the individual Row Groups based on the provided sorting columns.
 ///
 /// This will not result in a globally sorted Parquet File. But the individual Row Groups will be sorted.
@@ -17,6 +21,7 @@ pub struct SortedGroupsParquetWriter {
     buffer: SortingBuffer,
     properties: WriterProperties,
     inner: ArrowWriter<File>,
+    row_converter: arrow_row::RowConverter,
 }
 impl SortedGroupsParquetWriter {
     pub fn try_new(
@@ -28,14 +33,27 @@ impl SortedGroupsParquetWriter {
             return Err(SortingParquetError::NoSortingColumnsConfigured);
         }
         let writer = ArrowWriter::try_new(file, schema.clone(), Some(properties.clone()))?;
+        let row_converter = sorting::create_row_converter(
+            properties
+                .sorting_columns()
+                .ok_or(SortingParquetError::NoSortingColumnsConfigured)?,
+            schema.as_ref(),
+        )?;
         Ok(Self {
             schema,
-            buffer: SortingBuffer::new(properties.max_row_group_size()),
+            buffer: SortingBuffer::new(
+                properties
+                    .max_row_group_row_count()
+                    .unwrap_or(DEFAULT_MAX_ROW_GROUP_SIZE),
+            ),
             properties,
             inner: writer,
+            row_converter,
         })
     }
-    fn sorting_columns(&self) -> Result<&Vec<parquet::format::SortingColumn>, SortingParquetError> {
+    fn sorting_columns(
+        &self,
+    ) -> Result<&Vec<parquet::file::metadata::SortingColumn>, SortingParquetError> {
         self.properties
             .sorting_columns()
             .ok_or(SortingParquetError::NoSortingColumnsConfigured)
@@ -55,11 +73,18 @@ impl SortedGroupsParquetWriter {
                 ),
             ));
         }
-        let sorted_batch = sorting::sort_record_batch(batch, self.sorting_columns()?)?;
+        let sorted_batch = sorting::sort_record_batch_with_row_converter(
+            batch,
+            self.sorting_columns()?,
+            &self.row_converter,
+        )?;
         let results = self.buffer.add_batch(sorted_batch);
         if let Some(batches_to_write) = results {
-            let sorted_batch =
-                record_batch::merge_sorted_batches(&batches_to_write, self.sorting_columns()?)?;
+            let sorted_batch = record_batch::merge_sorted_batches_with_row_converter_unchecked(
+                &batches_to_write,
+                self.sorting_columns()?,
+                &self.row_converter,
+            )?;
             self.inner.write(&sorted_batch)?;
         }
 
@@ -72,8 +97,11 @@ impl SortedGroupsParquetWriter {
     /// See: [ArrowWriter::flush](parquet::arrow::ArrowWriter::flush)
     pub fn flush(&mut self) -> Result<(), SortingParquetError> {
         if let Some(batches_to_write) = self.buffer.flush() {
-            let sorted_batch =
-                record_batch::merge_sorted_batches(&batches_to_write, self.sorting_columns()?)?;
+            let sorted_batch = record_batch::merge_sorted_batches_with_row_converter_unchecked(
+                &batches_to_write,
+                self.sorting_columns()?,
+                &self.row_converter,
+            )?;
             self.inner.write(&sorted_batch)?;
         }
         self.inner.flush()?;
@@ -104,6 +132,8 @@ impl SortedGroupsParquetWriter {
 
 #[cfg(test)]
 mod tests {
+    use crate::test::get_test_dir;
+
     use super::*;
     use arrow::{
         array::{Int32Array, RecordBatch, StringArray},
@@ -111,11 +141,11 @@ mod tests {
     };
     use parquet::{
         arrow::arrow_reader::{ArrowReaderBuilder, ArrowReaderOptions},
+        file::metadata::SortingColumn,
         file::{
             properties::WriterProperties,
             reader::{FileReader, SerializedFileReader},
         },
-        format::SortingColumn,
     };
     use std::fs::File;
     use std::sync::Arc;
@@ -152,12 +182,12 @@ mod tests {
 
         // Create writer properties with sorting
         let properties = WriterProperties::builder()
-            .set_max_row_group_size(2) // Small row groups to force multiple groups
+            .set_max_row_group_row_count(Some(2)) // Small row groups to force multiple groups
             .set_sorting_columns(Some(sorting_columns))
             .build();
 
         // Create temporary output file
-        let test_file = File::create("small_row_groups.parquet").unwrap();
+        let test_file = File::create(get_test_dir().join("small_row_groups.parquet")).unwrap();
         // Create the sorting writer
         let mut writer =
             SortedGroupsParquetWriter::try_new(test_file, schema.clone(), properties).unwrap();
@@ -176,12 +206,12 @@ mod tests {
         // Use the new row group merge logic
         writer.close().unwrap();
         {
-            let test_file = File::open("small_row_groups.parquet").unwrap();
+            let test_file = File::open(get_test_dir().join("small_row_groups.parquet")).unwrap();
 
             let reader = SerializedFileReader::new(test_file).unwrap();
             assert_eq!(reader.num_row_groups(), 6, "Expected total of 6 row groups");
         }
-        let test_file = File::open("small_row_groups.parquet").unwrap();
+        let test_file = File::open(get_test_dir().join("small_row_groups.parquet")).unwrap();
         let mut parquet_reader = ArrowReaderBuilder::try_new_with_options(
             test_file,
             ArrowReaderOptions::new().with_schema(schema.clone()),
@@ -190,23 +220,22 @@ mod tests {
         .build()
         .unwrap();
         let record_batch_reader = parquet_reader.next().unwrap().unwrap();
-        let expected_ids: Vec<i32> = vec![
-            1, 2, 3, 4, 5, 0, 6, 7, 8, 9, 10
-        ];
-        let expected_names: Vec<&str> = vec![
-            "a", "b", "c", "d", "e", "z", "f", "g", "h", "i", "j"
-        ];
-        let actual_ids = record_batch_reader.column(0)
+        let expected_ids: Vec<i32> = vec![1, 3, 2, 4, 0, 5, 6, 7, 8, 9, 10];
+        let expected_names: Vec<&str> = vec!["a", "c", "b", "d", "z", "e", "f", "g", "h", "i", "j"];
+        let actual_ids = record_batch_reader
+            .column(0)
             .as_any()
             .downcast_ref::<Int32Array>()
-            .unwrap().iter()
+            .unwrap()
+            .iter()
             .flat_map(|v| v)
             .collect::<Vec<i32>>();
         let actual_names = record_batch_reader
             .column(1)
             .as_any()
             .downcast_ref::<StringArray>()
-            .unwrap().iter()
+            .unwrap()
+            .iter()
             .flat_map(|v| v)
             .collect::<Vec<&str>>();
         assert_eq!(actual_ids, expected_ids, "IDs should be sorted");

@@ -24,7 +24,7 @@ pub trait TestArrowType {
     fn random_instances(n: usize) -> Vec<Self>
     where
         Self: Sized;
-    fn sorting_columns() -> Vec<parquet::format::SortingColumn>
+    fn sorting_columns() -> Vec<parquet::file::metadata::SortingColumn>
     where
         Self: Sized;
 
@@ -41,4 +41,14 @@ pub trait TestArrowType {
     fn is_sorted(records: &[Self]) -> Option<&[Self]>
     where
         Self: Sized;
+}
+
+pub fn get_test_dir() -> std::path::PathBuf {
+    let cargo_workspace_dir =
+        std::env::var("CARGO_WORKSPACE_DIR").unwrap_or_else(|_| ".".to_string());
+    let dir = std::path::PathBuf::from(cargo_workspace_dir).join("test_output");
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).expect("Failed to create test_output directory");
+    }
+    dir
 }
