@@ -274,8 +274,7 @@ mod tests {
             .set_sorting_columns(Some(TickerItem::sorting_columns()))
             .build();
         let schema = TickerItem::schema();
-        let mut sorted_writer: SortingParquetWriter =
-            SortingParquetWriter::try_new(file, schema, props)?;
+        let mut sorted_writer = SortingParquetWriter::try_new(file, schema, props)?;
         let mut duration_sum_sorted = Duration::ZERO;
 
         for i in 0..50 {

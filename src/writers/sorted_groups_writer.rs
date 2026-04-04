@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::io::Write;
 
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
@@ -16,23 +16,23 @@ const DEFAULT_MAX_ROW_GROUP_SIZE: usize = 1024 * 1024;
 /// This will not result in a globally sorted Parquet File. But the individual Row Groups will be sorted.
 ///
 /// This can create a Parquet file that is more efficient to read but it will not be as efficient as a fully sorted Parquet file.
-pub struct SortedGroupsParquetWriter {
+pub struct SortedGroupsParquetWriter<W: Write + Send> {
     schema: SchemaRef,
     buffer: SortingBuffer,
     properties: WriterProperties,
-    inner: ArrowWriter<File>,
+    inner: ArrowWriter<W>,
     row_converter: arrow_row::RowConverter,
 }
-impl SortedGroupsParquetWriter {
+impl<W: Write + Send> SortedGroupsParquetWriter<W> {
     pub fn try_new(
-        file: File,
+        writer: W,
         schema: SchemaRef,
         properties: WriterProperties,
     ) -> Result<Self, SortingParquetError> {
         if properties.sorting_columns().is_none() {
             return Err(SortingParquetError::NoSortingColumnsConfigured);
         }
-        let writer = ArrowWriter::try_new(file, schema.clone(), Some(properties.clone()))?;
+        let inner = ArrowWriter::try_new(writer, schema.clone(), Some(properties.clone()))?;
         let row_converter = sorting::create_row_converter(
             properties
                 .sorting_columns()
@@ -47,7 +47,7 @@ impl SortedGroupsParquetWriter {
                     .unwrap_or(DEFAULT_MAX_ROW_GROUP_SIZE),
             ),
             properties,
-            inner: writer,
+            inner,
             row_converter,
         })
     }
@@ -114,12 +114,12 @@ impl SortedGroupsParquetWriter {
         Ok(())
     }
 
-    pub fn into_inner(mut self) -> Result<ArrowWriter<File>, SortingParquetError> {
+    pub fn into_inner(mut self) -> Result<ArrowWriter<W>, SortingParquetError> {
         self.flush()?;
         Ok(self.inner)
     }
 
-    pub fn into_inner_writer(self) -> Result<File, SortingParquetError> {
+    pub fn into_inner_writer(self) -> Result<W, SortingParquetError> {
         Ok(self.into_inner()?.into_inner()?)
     }
     pub fn writer_properties(&self) -> &WriterProperties {

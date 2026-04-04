@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::io::Write;
 use std::rc::Rc;
 
 use arrow::array::RecordBatch;
@@ -24,10 +25,10 @@ const DEFAULT_MAX_MEMORY_ROWS: usize = 1_000_000;
 ///
 /// Memory usage is bounded by `max_memory_rows` during the write phase, and by
 /// approximately one batch per run file during the merge phase.
-pub struct SortingParquetWriter {
+pub struct SortingParquetWriter<W: Write + Send> {
     schema: SchemaRef,
     properties: WriterProperties,
-    target: ArrowWriter<File>,
+    target: ArrowWriter<W>,
     row_converter: arrow_row::RowConverter,
     // In-memory buffer
     buffer: Vec<RecordBatch>,
@@ -40,14 +41,14 @@ pub struct SortingParquetWriter {
     run_count: usize,
 }
 
-impl SortingParquetWriter {
+impl<W: Write + Send> SortingParquetWriter<W> {
     /// Create a new `SortingParquetWriter` with the default memory limit (1M rows).
     pub fn try_new(
-        file: File,
+        writer: W,
         schema: SchemaRef,
         properties: WriterProperties,
     ) -> Result<Self, SortingParquetError> {
-        Self::try_new_with_memory_limit(file, schema, properties, DEFAULT_MAX_MEMORY_ROWS)
+        Self::try_new_with_memory_limit(writer, schema, properties, DEFAULT_MAX_MEMORY_ROWS)
     }
 
     /// Create a new `SortingParquetWriter` with a custom memory limit.
@@ -55,7 +56,7 @@ impl SortingParquetWriter {
     /// `max_memory_rows` controls how many rows are buffered in memory before
     /// being sorted and flushed to a temporary run file on disk.
     pub fn try_new_with_memory_limit(
-        file: File,
+        writer: W,
         schema: SchemaRef,
         properties: WriterProperties,
         max_memory_rows: usize,
@@ -63,7 +64,7 @@ impl SortingParquetWriter {
         if properties.sorting_columns().is_none() {
             return Err(SortingParquetError::NoSortingColumnsConfigured);
         }
-        let target = ArrowWriter::try_new(file, schema.clone(), Some(properties.clone()))?;
+        let target = ArrowWriter::try_new(writer, schema.clone(), Some(properties.clone()))?;
         let temp_dir = TempDir::with_prefix("sorting_parquet_writer")?;
         let row_converter = crate::sorting::create_row_converter(
             properties
