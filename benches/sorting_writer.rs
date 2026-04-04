@@ -147,11 +147,15 @@ fn bench_sorting_writer(c: &mut Criterion) {
                     let props = WriterProperties::builder()
                         .set_sorting_columns(Some(sorting_columns()))
                         .build();
-                    let mut writer = SortingParquetWriter::try_new_with_memory_limit(
+                    let options = sorting_parquet_writer::writers::SortingWriterOptions {
+                        max_memory_rows: max_mem,
+                        ..Default::default()
+                    };
+                    let mut writer = SortingParquetWriter::try_new_with_options(
                         file,
                         create_schema(),
                         props,
-                        max_mem,
+                        options,
                     )
                     .unwrap();
                     for batch in batches {
