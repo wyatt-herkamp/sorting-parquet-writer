@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
 use std::fs::File;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::compute::interleave_record_batch;
@@ -19,8 +19,8 @@ use crate::SortingParquetError;
 #[derive(Clone)]
 pub struct RunInfo {
     pub path: PathBuf,
-    pub min_sort_key: Rc<Vec<u8>>,
-    pub max_sort_key: Rc<Vec<u8>>,
+    pub min_sort_key: Arc<Vec<u8>>,
+    pub max_sort_key: Arc<Vec<u8>>,
 }
 
 /// A cursor into one sorted run file during merge.

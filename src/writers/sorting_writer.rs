@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::mem;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -153,15 +153,15 @@ impl<W: Write + Send> SortingParquetWriter<W> {
 
         self.run_files.push(RunInfo {
             path: run_path,
-            min_sort_key: Rc::new(min_sort_key),
-            max_sort_key: Rc::new(max_sort_key),
+            min_sort_key: Arc::new(min_sort_key),
+            max_sort_key: Arc::new(max_sort_key),
         });
         Ok(())
     }
 
     /// Finishes writing, performing the final merge of all sorted runs
-    /// and producing the globally sorted output file.
-    pub fn finish(&mut self) -> Result<(), SortingParquetError> {
+    /// and producing the globally sorted output file. Returns the underlying writer.
+    pub fn finish(mut self) -> Result<W, SortingParquetError> {
         let sorting_columns = self
             .properties
             .sorting_columns()
@@ -171,7 +171,6 @@ impl<W: Write + Send> SortingParquetWriter<W> {
         // Flush any remaining buffered data to a run
         self.flush_to_run()?;
 
-        let target = &mut self.target;
         let output_batch_size = self
             .properties
             .max_row_group_row_count()
@@ -180,7 +179,6 @@ impl<W: Write + Send> SortingParquetWriter<W> {
         match self.run_files.len() {
             0 => {
                 // No data written at all
-                target.finish()?;
             }
             1 => {
                 // Single run — already fully sorted, just copy through
@@ -189,14 +187,12 @@ impl<W: Write + Send> SortingParquetWriter<W> {
                     .with_batch_size(output_batch_size)
                     .build()?;
                 for batch in reader {
-                    target.write(&batch?)?;
-                    target.flush()?;
+                    self.target.write(&batch?)?;
+                    self.target.flush()?;
                 }
-                target.finish()?;
             }
             _ => {
                 // Multiple runs — streaming k-way merge
-
                 let merger = SortedRunMerger::try_new(
                     mem::take(&mut self.run_files),
                     sorting_columns,
@@ -207,16 +203,18 @@ impl<W: Write + Send> SortingParquetWriter<W> {
                 )?;
 
                 for batch_result in merger {
-                    target.write(&batch_result?)?;
-                    target.flush()?;
+                    self.target.write(&batch_result?)?;
+                    self.target.flush()?;
                 }
-                target.finish()?;
             }
         }
 
+        // into_inner calls finish() internally, writing the Parquet footer
+        let writer = self.target.into_inner()?;
         // temp_dir drops here, cleaning up all run files automatically
-        Ok(())
+        Ok(writer)
     }
+
     pub fn inner_mut(&mut self) -> &mut W {
         self.target.inner_mut()
     }

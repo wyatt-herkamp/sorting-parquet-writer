@@ -9,7 +9,6 @@ use sorting_parquet_writer::record_batch::streaming_merge::{RunInfo, SortedRunMe
 use sorting_parquet_writer::sorting::{create_row_converter, sort_record_batch};
 use sorting_parquet_writer::writers::{SortedGroupsParquetWriter, SortingParquetWriter};
 use std::hint::black_box;
-use std::rc::Rc;
 use std::sync::Arc;
 
 fn create_schema() -> SchemaRef {
@@ -115,8 +114,8 @@ fn create_sorted_run_files(
         writer.close().unwrap();
         runs.push(RunInfo {
             path,
-            min_sort_key: Rc::new(min_sort_key),
-            max_sort_key: Rc::new(max_sort_key),
+            min_sort_key: Arc::new(min_sort_key),
+            max_sort_key: Arc::new(max_sort_key),
         });
     }
 
