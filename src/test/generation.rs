@@ -19,7 +19,7 @@ fn generate_generic_unsorted_data() -> anyhow::Result<()> {
         eprintln!("Writing batch {}/10", i + 1);
         let items = TickerItem::random_instances(1024 * 1024);
         for chunk in items.chunks(128) {
-            let batch = TickerItem::into_record_batch(chunk.to_vec())?;
+            let batch = TickerItem::into_record_batch(chunk)?;
             writer.write(&batch)?;
         }
     }

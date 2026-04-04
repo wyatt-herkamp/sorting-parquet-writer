@@ -110,7 +110,7 @@ impl TestArrowType for TickerItem {
         SCHEMA.clone()
     }
 
-    fn into_record_batch(records: Vec<Self>) -> Result<RecordBatch, TestError>
+    fn into_record_batch(records: &[Self]) -> Result<RecordBatch, TestError>
     where
         Self: Sized,
     {
@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn test_random_ticker_item() {
         let item = TickerItem::random_instances(100);
-        let batch = TickerItem::into_record_batch(item).unwrap();
+        let batch = TickerItem::into_record_batch(&item).unwrap();
         let sorting_columns = TickerItem::sorting_columns();
 
         let sorted = crate::sorting::sort_record_batch(&batch, &sorting_columns).unwrap();
@@ -249,7 +249,7 @@ mod tests {
         let instant = std::time::Instant::now();
         let mut batches = Vec::new();
         for batch in item.chunks(128) {
-            let batch = TickerItem::into_record_batch(batch.to_vec()).unwrap();
+            let batch = TickerItem::into_record_batch(batch).unwrap();
             let sorted =
                 crate::sorting::sort_record_batch(&batch, &TickerItem::sorting_columns()).unwrap();
             batches.push(sorted);
@@ -281,8 +281,8 @@ mod tests {
         for i in 0..50 {
             eprintln!("Writing batch {}/50", i + 1);
             let items = TickerItem::random_instances(1024 * 1024);
-            for chunk in items.chunks(128) {
-                let batch = TickerItem::into_record_batch(chunk.to_vec())?;
+            for chunk in items.chunks(8192) {
+                let batch = TickerItem::into_record_batch(chunk)?;
                 let start = std::time::Instant::now();
                 sorted_writer.write(&batch)?;
                 duration_sum_sorted += start.elapsed();
@@ -294,18 +294,45 @@ mod tests {
             humantime::format_duration(duration_sum_sorted)
         );
 
+        // Verify sort order directly on Arrow arrays — no TickerItem conversion needed
+        let sorting_columns = TickerItem::sorting_columns();
+        let row_converter = crate::sorting::create_row_converter(
+            &sorting_columns,
+            TickerItem::schema().as_ref(),
+        )?;
         let mut reader = ArrowReaderBuilder::try_new_with_options(
             std::fs::File::open(&path)?,
             ArrowReaderOptions::new().with_schema(TickerItem::schema()),
         )
         .unwrap()
-        .with_batch_size(200)
+        .with_batch_size(65536)
         .build()?;
+        let mut prev_last_row: Option<Vec<u8>> = None;
         while let Some(batch) = reader.next() {
             let batch = batch?;
-            let items_back = TickerItem::from_record_batch(&batch)?;
-            assert_eq!(items_back.len(), batch.num_rows());
-            assert_eq!(TickerItem::is_sorted(&items_back), None);
+            let cols: Vec<_> = sorting_columns
+                .iter()
+                .map(|col| batch.column(col.column_idx as usize).clone())
+                .collect();
+            let rows = row_converter.convert_columns(&cols)?;
+
+            // Check within batch: each row must be >= previous
+            for i in 1..batch.num_rows() {
+                assert!(
+                    rows.row(i - 1) <= rows.row(i),
+                    "Sort order violation at row {i} within batch"
+                );
+            }
+            // Check across batch boundary
+            if let Some(prev) = &prev_last_row {
+                assert!(
+                    prev.as_slice() <= rows.row(0).as_ref(),
+                    "Sort order violation across batch boundary"
+                );
+            }
+            if batch.num_rows() > 0 {
+                prev_last_row = Some(rows.row(batch.num_rows() - 1).as_ref().to_vec());
+            }
         }
         Ok(())
     }

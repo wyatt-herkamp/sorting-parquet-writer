@@ -115,12 +115,13 @@ impl SortingParquetWriter {
         self.buffer.clear();
         self.buffered_rows = 0;
 
-        // Sort the combined batch
-        let sorted = crate::sorting::sort_record_batch_with_row_converter(
-            &combined,
-            &sorting_columns,
-            &self.row_converter,
-        )?;
+        // Sort the combined batch and extract min/max sort keys in one pass
+        let (sorted, (min_sort_key, max_sort_key)) =
+            crate::sorting::sort_record_batch_with_row_converter_returning_extremes(
+                &combined,
+                &sorting_columns,
+                &self.row_converter,
+            )?;
         drop(combined);
 
         // Write to a new run file
@@ -141,15 +142,6 @@ impl SortingParquetWriter {
                     .build(),
             ),
         )?;
-
-        // Capture min/max sort keys before writing (sorted batch: first row = min, last = max)
-        let sort_cols: Vec<_> = sorting_columns
-            .iter()
-            .map(|col| sorted.column(col.column_idx as usize).clone())
-            .collect();
-        let rows = self.row_converter.convert_columns(&sort_cols)?;
-        let min_sort_key = rows.row(0).as_ref().to_vec();
-        let max_sort_key = rows.row(sorted.num_rows() - 1).as_ref().to_vec();
 
         // Write as a single batch — ArrowWriter handles page sizing internally
         run_writer.write(&sorted)?;
@@ -451,7 +443,7 @@ mod tests {
         for _ in 0..3 {
             let items = TickerItem::random_instances(100_000);
             for chunk in items.chunks(128) {
-                let batch = TickerItem::into_record_batch(chunk.to_vec()).unwrap();
+                let batch = TickerItem::into_record_batch(chunk).unwrap();
                 writer.write(&batch).unwrap();
             }
         }

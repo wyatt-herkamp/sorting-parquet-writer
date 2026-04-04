@@ -38,6 +38,21 @@ pub fn sort_record_batch_with_row_converter(
     sorting_columns: &[SortingColumn],
     row_converter: &RowConverter,
 ) -> Result<RecordBatch, arrow::error::ArrowError> {
+    let (batch, _) = sort_record_batch_with_row_converter_returning_extremes(
+        batch,
+        sorting_columns,
+        row_converter,
+    )?;
+    Ok(batch)
+}
+
+/// Sorts a RecordBatch and returns the sorted batch along with the min and max
+/// sort key bytes. Avoids a second `convert_columns` call when min/max are needed.
+pub fn sort_record_batch_with_row_converter_returning_extremes(
+    batch: &RecordBatch,
+    sorting_columns: &[SortingColumn],
+    row_converter: &RowConverter,
+) -> Result<(RecordBatch, (Vec<u8>, Vec<u8>)), arrow::error::ArrowError> {
     let columns: Vec<ArrayRef> = sorting_columns
         .iter()
         .map(|col| batch.column(col.column_idx as usize).clone())
@@ -49,14 +64,22 @@ pub fn sort_record_batch_with_row_converter(
         let row_b = rows.row_unchecked(b as usize);
         row_a.cmp(&row_b)
     });
+
+    // Extract min/max sort keys from the sorted indices (first = min, last = max)
+    let min_key = unsafe { rows.row_unchecked(indices[0] as usize) }
+        .as_ref()
+        .to_vec();
+    let max_key = unsafe { rows.row_unchecked(*indices.last().unwrap() as usize) }
+        .as_ref()
+        .to_vec();
+
     let indices_array = arrow::array::UInt32Array::from_iter(indices);
-    // Use arrow::compute::take on each column to build the sorted batch
     let sorted_columns: Vec<ArrayRef> = (0..batch.num_columns())
         .map(|i| take(batch.column(i).as_ref(), &indices_array, None))
         .collect::<Result<_, _>>()?;
     let sorted_batch = arrow::record_batch::RecordBatch::try_new(batch.schema(), sorted_columns)?;
 
-    Ok(sorted_batch)
+    Ok((sorted_batch, (min_key, max_key)))
 }
 
 #[cfg(test)]

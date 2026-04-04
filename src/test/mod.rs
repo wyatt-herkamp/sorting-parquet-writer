@@ -30,7 +30,7 @@ pub trait TestArrowType {
 
     fn schema() -> SchemaRef;
 
-    fn into_record_batch(records: Vec<Self>) -> Result<RecordBatch, TestError>
+    fn into_record_batch(records: &[Self]) -> Result<RecordBatch, TestError>
     where
         Self: Sized;
 
