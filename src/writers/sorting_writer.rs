@@ -13,6 +13,9 @@ use tempfile::TempDir;
 
 use crate::SortingParquetError;
 use crate::record_batch::streaming_merge::{RunInfo, SortedRunMerger};
+use crate::writers::progress::{
+    FinishPhase, FinishProgress, FinishProgressHandler, NoopProgressHandler,
+};
 
 /// Default maximum number of rows to buffer in memory before flushing to a sorted run file.
 const DEFAULT_MAX_MEMORY_ROWS: usize = 1_000_000;
@@ -219,7 +222,31 @@ impl<W: Write + Send> SortingParquetWriter<W> {
     ///
     /// This is the only way to produce a valid Parquet file — dropping the
     /// writer without calling `finish()` will not write the Parquet footer.
-    pub fn finish(mut self) -> Result<W, SortingParquetError> {
+    pub fn finish(self) -> Result<W, SortingParquetError> {
+        self.finish_with_progress(NoopProgressHandler)
+    }
+
+    /// Like [`finish()`](Self::finish), but calls `handler` after each batch
+    /// is written to the final output during the merge phase.
+    ///
+    /// The handler receives a [`FinishProgress`] with rows written, total rows,
+    /// batch count, and the current phase. Use [`FinishProgress::fraction_complete()`]
+    /// for a `[0.0, 1.0]` progress fraction.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sorting_parquet_writer::writers::{SortingParquetWriter, FinishProgress};
+    /// # fn example(writer: SortingParquetWriter<std::fs::File>) {
+    /// writer.finish_with_progress(|p: &FinishProgress| {
+    ///     println!("Merge progress: {:.1}%", p.fraction_complete() * 100.0);
+    /// }).unwrap();
+    /// # }
+    /// ```
+    pub fn finish_with_progress(
+        mut self,
+        mut handler: impl FinishProgressHandler,
+    ) -> Result<W, SortingParquetError> {
         let sorting_columns = self
             .properties
             .sorting_columns()
@@ -234,22 +261,49 @@ impl<W: Write + Send> SortingParquetWriter<W> {
             .max_row_group_row_count()
             .unwrap_or(DEFAULT_MAX_MEMORY_ROWS);
 
-        match self.run_files.len() {
+        let num_runs = self.run_files.len();
+
+        match num_runs {
             0 => {
                 // No data written at all
             }
             1 => {
                 // Single run — already fully sorted, just copy through
                 let file = File::open(&self.run_files[0].path)?;
-                let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
-                    .with_batch_size(output_batch_size)
-                    .build()?;
+                let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+                let total_rows =
+                    builder.metadata().file_metadata().num_rows() as u64;
+                let reader = builder.with_batch_size(output_batch_size).build()?;
+
+                let mut progress = FinishProgress {
+                    phase: FinishPhase::CopyThrough,
+                    rows_written: 0,
+                    batches_written: 0,
+                    total_rows,
+                    num_runs: 1,
+                };
+
                 for batch in reader {
-                    self.target.write(&batch?)?;
+                    let batch = batch?;
+                    self.target.write(&batch)?;
                     self.target.flush()?;
+                    progress.rows_written += batch.num_rows() as u64;
+                    progress.batches_written += 1;
+                    handler.on_batch_written(&progress);
                 }
             }
             _ => {
+                // Read total row count from all run file metadata
+                let total_rows = self.read_total_rows()?;
+
+                let mut progress = FinishProgress {
+                    phase: FinishPhase::Merging,
+                    rows_written: 0,
+                    batches_written: 0,
+                    total_rows,
+                    num_runs,
+                };
+
                 // Multiple runs — streaming k-way merge
                 let merger = SortedRunMerger::try_new(
                     mem::take(&mut self.run_files),
@@ -261,8 +315,12 @@ impl<W: Write + Send> SortingParquetWriter<W> {
                 )?;
 
                 for batch_result in merger {
-                    self.target.write(&batch_result?)?;
+                    let batch = batch_result?;
+                    self.target.write(&batch)?;
                     self.target.flush()?;
+                    progress.rows_written += batch.num_rows() as u64;
+                    progress.batches_written += 1;
+                    handler.on_batch_written(&progress);
                 }
             }
         }
@@ -326,6 +384,17 @@ impl<W: Write + Send> SortingParquetWriter<W> {
     }
 
     // ── Internal ────────────────────────────────────────────────────────
+
+    /// Sum the row counts from all run file Parquet metadata.
+    fn read_total_rows(&self) -> Result<u64, SortingParquetError> {
+        let mut total = 0u64;
+        for run in &self.run_files {
+            let file = File::open(&run.path)?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+            total += builder.metadata().file_metadata().num_rows() as u64;
+        }
+        Ok(total)
+    }
 
     /// Sort the in-memory buffer and write it to a new run file.
     fn flush_to_run(&mut self) -> Result<(), SortingParquetError> {
