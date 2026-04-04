@@ -134,7 +134,7 @@ fn bench_sorting_writer(c: &mut Criterion) {
         (500_000, 100_000),
     ] {
         let batches = generate_batches(total_rows, 1024);
-        let num_runs = (total_rows + max_mem - 1) / max_mem;
+        let num_runs = total_rows.div_ceil(max_mem);
 
         group.throughput(Throughput::Elements(total_rows as u64));
         group.bench_with_input(

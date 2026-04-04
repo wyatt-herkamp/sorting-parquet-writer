@@ -83,7 +83,7 @@ fn main() -> Result<()> {
             .context("Failed to open parquet")?;
 
     let schema = reader_builder.schema().clone();
-    
+
     // Use CLI sort columns if provided, otherwise try to read from parquet metadata
     let sort_columns = if !cli.sort_columns.is_empty() {
         println!("Using sort columns from CLI arguments...");
@@ -135,16 +135,16 @@ fn extract_sort_columns_from_metadata(
     schema: &arrow::datatypes::Schema,
 ) -> Result<Vec<SortingColumn>> {
     let metadata = reader_builder.metadata();
-    
+
     // Check if there are any row groups
     if metadata.num_row_groups() == 0 {
         bail!("Parquet file contains no row groups");
     }
-    
+
     // Get sorting metadata from the first row group
     // Note: In a properly sorted parquet file, all row groups should have the same sorting specification
     let row_group_meta = metadata.row_group(0);
-    
+
     match row_group_meta.sorting_columns() {
         Some(sorting_cols) => {
             if sorting_cols.is_empty() {
@@ -153,9 +153,12 @@ fn extract_sort_columns_from_metadata(
                     "Please specify sort columns using --sort-columns or ensure the parquet file was written with sorting metadata."
                 );
             }
-            
-            println!("Found {} sorting column(s) in parquet metadata", sorting_cols.len());
-            
+
+            println!(
+                "Found {} sorting column(s) in parquet metadata",
+                sorting_cols.len()
+            );
+
             // Validate that all row groups have the same sorting specification
             for (idx, rg_meta) in metadata.row_groups().iter().enumerate().skip(1) {
                 match rg_meta.sorting_columns() {
@@ -174,7 +177,7 @@ fn extract_sort_columns_from_metadata(
                     _ => {} // Same sorting specification, which is expected
                 }
             }
-            
+
             // Validate that all column indices exist in the schema
             for col in sorting_cols.iter() {
                 if col.column_idx < 0 || (col.column_idx as usize) >= schema.fields().len() {
@@ -185,7 +188,7 @@ fn extract_sort_columns_from_metadata(
                     );
                 }
             }
-            
+
             Ok(sorting_cols.clone())
         }
         None => {
@@ -366,6 +369,7 @@ fn check_sorted(
     Ok(Ok(()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_sort_error(
     batch_number: usize,
     row_number: usize,

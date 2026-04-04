@@ -228,7 +228,7 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .unwrap()
             .iter()
-            .flat_map(|v| v)
+            .flatten()
             .collect::<Vec<i32>>();
         let actual_names = record_batch_reader
             .column(1)
@@ -236,7 +236,7 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap()
             .iter()
-            .flat_map(|v| v)
+            .flatten()
             .collect::<Vec<&str>>();
         assert_eq!(actual_ids, expected_ids, "IDs should be sorted");
         assert_eq!(actual_names, expected_names, "Names should be sorted");

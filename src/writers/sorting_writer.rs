@@ -271,8 +271,7 @@ impl<W: Write + Send> SortingParquetWriter<W> {
                 // Single run — already fully sorted, just copy through
                 let file = File::open(&self.run_files[0].path)?;
                 let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-                let total_rows =
-                    builder.metadata().file_metadata().num_rows() as u64;
+                let total_rows = builder.metadata().file_metadata().num_rows() as u64;
                 let reader = builder.with_batch_size(output_batch_size).build()?;
 
                 let mut progress = FinishProgress {
@@ -530,8 +529,7 @@ mod tests {
 
         let batch = parquet_reader.next().unwrap().unwrap();
         let expected_ids: Vec<i32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-        let expected_names: Vec<&str> =
-            vec!["z", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
+        let expected_names: Vec<&str> = vec!["z", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
         let actual_ids = batch
             .column(0)
             .as_any()

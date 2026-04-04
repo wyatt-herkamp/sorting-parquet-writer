@@ -295,11 +295,9 @@ mod tests {
 
         // Verify sort order directly on Arrow arrays — no TickerItem conversion needed
         let sorting_columns = TickerItem::sorting_columns();
-        let row_converter = crate::sorting::create_row_converter(
-            &sorting_columns,
-            TickerItem::schema().as_ref(),
-        )?;
-        let mut reader = ArrowReaderBuilder::try_new_with_options(
+        let row_converter =
+            crate::sorting::create_row_converter(&sorting_columns, TickerItem::schema().as_ref())?;
+        let reader = ArrowReaderBuilder::try_new_with_options(
             std::fs::File::open(&path)?,
             ArrowReaderOptions::new().with_schema(TickerItem::schema()),
         )
@@ -307,7 +305,7 @@ mod tests {
         .with_batch_size(65536)
         .build()?;
         let mut prev_last_row: Option<Vec<u8>> = None;
-        while let Some(batch) = reader.next() {
+        for batch in reader {
             let batch = batch?;
             let cols: Vec<_> = sorting_columns
                 .iter()

@@ -45,14 +45,14 @@ pub fn sort_record_batch_with_row_converter(
     )?;
     Ok(batch)
 }
-
+pub type SortExtremes = (Vec<u8>, Vec<u8>);
 /// Sorts a RecordBatch and returns the sorted batch along with the min and max
 /// sort key bytes. Avoids a second `convert_columns` call when min/max are needed.
 pub fn sort_record_batch_with_row_converter_returning_extremes(
     batch: &RecordBatch,
     sorting_columns: &[SortingColumn],
     row_converter: &RowConverter,
-) -> Result<(RecordBatch, (Vec<u8>, Vec<u8>)), arrow::error::ArrowError> {
+) -> Result<(RecordBatch, SortExtremes), arrow::error::ArrowError> {
     let columns: Vec<ArrayRef> = sorting_columns
         .iter()
         .map(|col| batch.column(col.column_idx as usize).clone())

@@ -31,7 +31,7 @@ fn create_schema() -> SchemaRef {
 
 fn generate_random_data(size: usize) -> TestData {
     let mut rng = rng();
-    let tickers = vec!["AAPL", "GOOG", "MSFT", "AMZN", "TSLA", "META", "NVDA"];
+    let tickers = ["AAPL", "GOOG", "MSFT", "AMZN", "TSLA", "META", "NVDA"];
 
     // Generate random ticker data
     let ticker_data: Vec<String> = (0..size)
@@ -76,7 +76,7 @@ fn generate_random_data(size: usize) -> TestData {
 }
 
 fn generate_sorted_data(size: usize) -> TestData {
-    let tickers = vec!["AAPL", "GOOG", "MSFT", "AMZN", "TSLA"];
+    let tickers = ["AAPL", "GOOG", "MSFT", "AMZN", "TSLA"];
 
     let mut ticker_data: Vec<String> = Vec::with_capacity(size);
     let mut price_data: Vec<f64> = Vec::with_capacity(size);

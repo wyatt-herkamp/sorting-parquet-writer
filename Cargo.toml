@@ -2,8 +2,13 @@
 name = "sorting-parquet-writer"
 version = "0.1.0"
 edition = "2024"
-description = "A Rust Implementation of Parquet-Go's SortingWriter"
+description = "A Rust library for writing sorted Parquet files using Apache Arrow."
 license = "Apache-2.0 OR MIT"
+authors = ["Wyatt Herkamp <wherkamp@gmail.com>"]
+categories = ["data-processing", "parquet", "arrow", "sorting"]
+documentation = "https://docs.rs/sorting-parquet-writer"
+readme = "README.md"
+
 [dependencies]
 arrow = { version = "58", features = ["chrono-tz"] }
 arrow-schema = "58"
@@ -24,6 +29,7 @@ arrow = { version = "58", features = ["prettyprint"] }
 humantime = "2"
 criterion = "0.8"
 clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
 
 [[bench]]
 name = "sort_record_batch"
