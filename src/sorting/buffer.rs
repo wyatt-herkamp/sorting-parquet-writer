@@ -19,7 +19,6 @@ impl SortingBuffer {
         }
     }
     /// Adds a RecordBatch to the buffer and updates the total number of rows.
-    ///
     pub fn add_batch(&mut self, batch: RecordBatch) -> Option<Vec<RecordBatch>> {
         let new_total_rows = self.num_rows + batch.num_rows();
         if new_total_rows >= self.maximum_rows_per_group {

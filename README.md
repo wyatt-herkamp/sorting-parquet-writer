@@ -49,16 +49,18 @@ let mut writer = SortingParquetWriter::try_new(file, schema, props).unwrap();
 
 Produces a **globally sorted** Parquet file using external merge sort:
 
-1. **Write phase** — buffers incoming `RecordBatch`es in memory. When the buffer reaches `max_memory_rows`, it is sorted and flushed to a temporary run file on disk.
+1. **Write phase** — buffers incoming `RecordBatch`es in memory. When the configured `FlushThreshold` is reached (row count, byte size, or either), the buffer is sorted and flushed to a temporary run file on disk.
 2. **Merge phase** (`finish()`) — all sorted run files are merged via a streaming k-way merge into the final output.
 
 Configure via `SortingWriterOptions`:
 
 ```rust
-use sorting_parquet_writer::writers::SortingWriterOptions;
+use sorting_parquet_writer::writers::{SortingWriterOptions, FlushThreshold};
 
 let options = SortingWriterOptions {
-    max_memory_rows: 500_000,                          // rows before spilling (default: 1M)
+    flush_threshold: FlushThreshold::Rows(500_000),     // rows before spilling (default: 1M)
+    // Or use byte-based: FlushThreshold::Bytes(256 * 1024 * 1024)
+    // Or both: FlushThreshold::Either { max_rows: 500_000, max_bytes: 256 * 1024 * 1024 }
     temp_dir: Some("/fast-ssd/tmp".into()),             // run file location
     run_file_properties: None,                          // compression for run files
     ..Default::default()

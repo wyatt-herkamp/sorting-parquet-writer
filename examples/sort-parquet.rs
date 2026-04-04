@@ -5,7 +5,9 @@ use parquet::{
     arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder},
     file::{metadata::SortingColumn, properties::WriterProperties},
 };
-use sorting_parquet_writer::writers::{FinishProgress, SortingParquetWriter, SortingWriterOptions};
+use sorting_parquet_writer::writers::{
+    FinishProgress, FlushThreshold, SortingParquetWriter, SortingWriterOptions,
+};
 use std::{fmt::Debug, path::PathBuf, str::FromStr};
 
 #[derive(clap::Parser, Debug, Clone)]
@@ -129,7 +131,7 @@ fn main() -> Result<()> {
         .build();
 
     let options = SortingWriterOptions {
-        max_memory_rows: cli.max_memory_rows.unwrap_or(1_000_000),
+        flush_threshold: FlushThreshold::Rows(cli.max_memory_rows.unwrap_or(1_000_000)),
         ..Default::default()
     };
 

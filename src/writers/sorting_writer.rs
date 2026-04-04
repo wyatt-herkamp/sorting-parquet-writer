@@ -20,6 +20,52 @@ use crate::writers::progress::{
 /// Default maximum number of rows to buffer in memory before flushing to a sorted run file.
 const DEFAULT_MAX_MEMORY_ROWS: usize = 1_000_000;
 
+/// Controls when the in-memory buffer is flushed to a sorted run file on disk.
+///
+/// # Example
+///
+/// ```rust
+/// use sorting_parquet_writer::writers::FlushThreshold;
+///
+/// // Flush after 500k rows
+/// let by_rows = FlushThreshold::Rows(500_000);
+///
+/// // Flush after ~256 MB of buffered data
+/// let by_bytes = FlushThreshold::Bytes(256 * 1024 * 1024);
+///
+/// // Flush when either limit is reached (whichever comes first)
+/// let either = FlushThreshold::Either {
+///     max_rows: 500_000,
+///     max_bytes: 256 * 1024 * 1024,
+/// };
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushThreshold {
+    /// Flush when the buffered row count reaches this limit.
+    Rows(usize),
+    /// Flush when the estimated in-memory size of buffered data reaches this
+    /// many bytes. The size is estimated using Arrow's `get_array_memory_size()`.
+    Bytes(usize),
+    /// Flush when *either* the row count or byte size limit is reached,
+    /// whichever comes first. This is useful for bounding memory usage when
+    /// row sizes vary.
+    Either { max_rows: usize, max_bytes: usize },
+}
+
+impl FlushThreshold {
+    /// Returns `true` if the current buffer state exceeds this threshold.
+    fn should_flush(&self, buffered_rows: usize, buffered_bytes: usize) -> bool {
+        match self {
+            FlushThreshold::Rows(max) => buffered_rows >= *max,
+            FlushThreshold::Bytes(max) => buffered_bytes >= *max,
+            FlushThreshold::Either {
+                max_rows,
+                max_bytes,
+            } => buffered_rows >= *max_rows || buffered_bytes >= *max_bytes,
+        }
+    }
+}
+
 /// Configuration options for the sorting writer's external merge sort behavior.
 ///
 /// These options control how data is buffered, sorted, and spilled to disk
@@ -29,23 +75,24 @@ const DEFAULT_MAX_MEMORY_ROWS: usize = 1_000_000;
 /// # Example
 ///
 /// ```rust,no_run
-/// use sorting_parquet_writer::writers::SortingWriterOptions;
+/// use sorting_parquet_writer::writers::{SortingWriterOptions, FlushThreshold};
 /// use std::path::PathBuf;
 ///
 /// let options = SortingWriterOptions {
-///     max_memory_rows: 500_000,
+///     flush_threshold: FlushThreshold::Either {
+///         max_rows: 500_000,
+///         max_bytes: 256 * 1024 * 1024,
+///     },
 ///     temp_dir: Some(PathBuf::from("/fast-ssd/tmp")),
 ///     ..Default::default()
 /// };
 /// ```
 #[derive(Debug, Clone)]
 pub struct SortingWriterOptions {
-    /// Maximum number of rows to buffer in memory before flushing to a sorted
-    /// run file on disk. Larger values use more memory but produce fewer run
-    /// files, resulting in a faster merge phase.
+    /// Controls when buffered data is flushed to a sorted run file.
     ///
-    /// Default: 1,000,000
-    pub max_memory_rows: usize,
+    /// Default: `FlushThreshold::Rows(1_000_000)`
+    pub flush_threshold: FlushThreshold,
 
     /// Directory for temporary sorted run files. If `None`, the system's
     /// default temp directory is used.
@@ -71,7 +118,7 @@ pub struct SortingWriterOptions {
 impl Default for SortingWriterOptions {
     fn default() -> Self {
         Self {
-            max_memory_rows: DEFAULT_MAX_MEMORY_ROWS,
+            flush_threshold: FlushThreshold::Rows(DEFAULT_MAX_MEMORY_ROWS),
             temp_dir: None,
             run_file_properties: None,
         }
@@ -81,8 +128,8 @@ impl Default for SortingWriterOptions {
 /// A Parquet writer that produces a globally sorted output file.
 ///
 /// Uses an external merge sort strategy:
-/// 1. **Write phase:** Buffers incoming [`RecordBatch`]es in memory up to
-///    [`SortingWriterOptions::max_memory_rows`]. When the limit is reached,
+/// 1. **Write phase:** Buffers incoming [`RecordBatch`]es in memory until the
+///    configured [`FlushThreshold`] is reached. When the limit is reached,
 ///    the buffer is sorted and written to a temporary "run" file on disk.
 /// 2. **Merge phase (at [`finish()`](Self::finish)):** All sorted run files are merged
 ///    via a streaming k-way merge, producing the final globally sorted output.
@@ -120,6 +167,7 @@ pub struct SortingParquetWriter<W: Write + Send> {
     row_converter: Option<arrow_row::RowConverter>,
     buffer: Vec<RecordBatch>,
     buffered_rows: usize,
+    buffered_bytes: usize,
     options: SortingWriterOptions,
     temp_dir: TempDir,
     run_files: Vec<RunInfo>,
@@ -181,6 +229,7 @@ impl<W: Write + Send> SortingParquetWriter<W> {
             row_converter: Some(row_converter),
             buffer: Vec::new(),
             buffered_rows: 0,
+            buffered_bytes: 0,
             options,
             temp_dir,
             run_files: Vec::new(),
@@ -193,16 +242,31 @@ impl<W: Write + Send> SortingParquetWriter<W> {
     /// Writes a [`RecordBatch`] to the writer.
     ///
     /// Data is buffered in memory and periodically sorted and flushed to
-    /// temporary run files on disk when the buffer reaches `max_memory_rows`.
+    /// temporary run files on disk when the configured [`FlushThreshold`] is reached.
     /// The batch schema must match the schema provided at construction.
     pub fn write(&mut self, batch: &RecordBatch) -> Result<(), SortingParquetError> {
-        self.buffer.push(batch.clone());
         self.buffered_rows += batch.num_rows();
+        self.buffered_bytes += batch.get_array_memory_size();
+        self.buffer.push(batch.clone());
 
-        if self.buffered_rows >= self.options.max_memory_rows {
+        if self
+            .options
+            .flush_threshold
+            .should_flush(self.buffered_rows, self.buffered_bytes)
+        {
             self.flush_to_run()?;
         }
         Ok(())
+    }
+
+    /// Manually flushes the in-memory buffer to a new sorted run file on disk.
+    ///
+    /// This can be used to control memory usage externally (e.g., based on
+    /// system memory pressure) regardless of the configured [`FlushThreshold`].
+    ///
+    /// This is a no-op if the buffer is empty.
+    pub fn flush_buffer(&mut self) -> Result<(), SortingParquetError> {
+        self.flush_to_run()
     }
 
     /// Appends a key-value metadata entry to the Parquet file footer.
@@ -338,6 +402,12 @@ impl<W: Write + Send> SortingParquetWriter<W> {
         self.buffered_rows
     }
 
+    /// Returns the estimated byte size of data currently buffered in memory,
+    /// waiting to be sorted and flushed to a run file.
+    pub fn in_progress_bytes(&self) -> usize {
+        self.buffered_bytes
+    }
+
     /// Returns the number of sorted run files that have been flushed to disk.
     ///
     /// Each run file contains up to `max_memory_rows` sorted rows. During
@@ -412,6 +482,7 @@ impl<W: Write + Send> SortingParquetWriter<W> {
         let combined = arrow::compute::concat_batches(&self.schema, &self.buffer)?;
         self.buffer.clear();
         self.buffered_rows = 0;
+        self.buffered_bytes = 0;
 
         // Sort the combined batch and extract min/max sort keys in one pass
         let (sorted, (min_sort_key, max_sort_key)) =
@@ -568,7 +639,7 @@ mod tests {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let file = temp.reopen().unwrap();
         let options = SortingWriterOptions {
-            max_memory_rows: 3,
+            flush_threshold: FlushThreshold::Rows(3),
             ..Default::default()
         };
         let mut writer =
@@ -637,7 +708,7 @@ mod tests {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let file = temp.reopen().unwrap();
         let options = SortingWriterOptions {
-            max_memory_rows: 100,
+            flush_threshold: FlushThreshold::Rows(100),
             ..Default::default()
         };
         let mut writer =
@@ -682,7 +753,7 @@ mod tests {
             .build();
         let schema = TickerItem::schema();
         let options = SortingWriterOptions {
-            max_memory_rows: 100_000,
+            flush_threshold: FlushThreshold::Rows(100_000),
             ..Default::default()
         };
         let mut writer =
@@ -715,5 +786,177 @@ mod tests {
             total_rows += batch.num_rows();
         }
         assert_eq!(total_rows, 300_000);
+    }
+
+    #[test]
+    fn test_flush_threshold_bytes() {
+        let schema = create_test_schema();
+        let sorting_columns = vec![SortingColumn {
+            column_idx: 0,
+            descending: false,
+            nulls_first: false,
+        }];
+        let properties = WriterProperties::builder()
+            .set_sorting_columns(Some(sorting_columns))
+            .build();
+
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let file = temp.reopen().unwrap();
+        // Use a very small byte threshold to force spills
+        let options = SortingWriterOptions {
+            flush_threshold: FlushThreshold::Bytes(1),
+            ..Default::default()
+        };
+        let mut writer =
+            SortingParquetWriter::try_new_with_options(file, schema.clone(), properties, options)
+                .unwrap();
+
+        writer
+            .write(&create_test_batch(vec![3, 1], vec!["c", "a"]))
+            .unwrap();
+        assert!(
+            writer.num_run_files() > 0,
+            "Should have spilled to run file"
+        );
+        assert_eq!(writer.in_progress_rows(), 0);
+        assert_eq!(writer.in_progress_bytes(), 0);
+
+        writer
+            .write(&create_test_batch(vec![2, 0], vec!["b", "z"]))
+            .unwrap();
+        writer.finish().unwrap();
+
+        // Verify output is sorted
+        let file = temp.reopen().unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut all_ids = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                all_ids.push(ids.value(i));
+            }
+        }
+        assert_eq!(all_ids, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_flush_threshold_either() {
+        let schema = create_test_schema();
+        let sorting_columns = vec![SortingColumn {
+            column_idx: 0,
+            descending: false,
+            nulls_first: false,
+        }];
+        let properties = WriterProperties::builder()
+            .set_sorting_columns(Some(sorting_columns))
+            .build();
+
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let file = temp.reopen().unwrap();
+        // Row limit is very high, but byte limit is tiny — bytes should trigger
+        let options = SortingWriterOptions {
+            flush_threshold: FlushThreshold::Either {
+                max_rows: usize::MAX,
+                max_bytes: 1,
+            },
+            ..Default::default()
+        };
+        let mut writer =
+            SortingParquetWriter::try_new_with_options(file, schema.clone(), properties, options)
+                .unwrap();
+
+        writer
+            .write(&create_test_batch(vec![3, 1, 2], vec!["c", "a", "b"]))
+            .unwrap();
+        assert!(
+            writer.num_run_files() > 0,
+            "Bytes threshold should have triggered"
+        );
+
+        writer.finish().unwrap();
+
+        let file = temp.reopen().unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut all_ids = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                all_ids.push(ids.value(i));
+            }
+        }
+        assert_eq!(all_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_flush_buffer_manual() {
+        let schema = create_test_schema();
+        let sorting_columns = vec![SortingColumn {
+            column_idx: 0,
+            descending: false,
+            nulls_first: false,
+        }];
+        let properties = WriterProperties::builder()
+            .set_sorting_columns(Some(sorting_columns))
+            .build();
+
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let file = temp.reopen().unwrap();
+        let mut writer = SortingParquetWriter::try_new(file, schema.clone(), properties).unwrap();
+
+        writer
+            .write(&create_test_batch(vec![3, 1], vec!["c", "a"]))
+            .unwrap();
+        assert_eq!(writer.num_run_files(), 0);
+        assert!(writer.in_progress_rows() > 0);
+        assert!(writer.in_progress_bytes() > 0);
+
+        writer.flush_buffer().unwrap();
+        assert_eq!(writer.num_run_files(), 1);
+        assert_eq!(writer.in_progress_rows(), 0);
+        assert_eq!(writer.in_progress_bytes(), 0);
+
+        // Flush on empty buffer is a no-op
+        writer.flush_buffer().unwrap();
+        assert_eq!(writer.num_run_files(), 1);
+
+        writer
+            .write(&create_test_batch(vec![2, 0], vec!["b", "z"]))
+            .unwrap();
+        writer.finish().unwrap();
+
+        let file = temp.reopen().unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut all_ids = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                all_ids.push(ids.value(i));
+            }
+        }
+        assert_eq!(all_ids, vec![0, 1, 2, 3]);
     }
 }

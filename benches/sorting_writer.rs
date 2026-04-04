@@ -148,7 +148,9 @@ fn bench_sorting_writer(c: &mut Criterion) {
                         .set_sorting_columns(Some(sorting_columns()))
                         .build();
                     let options = sorting_parquet_writer::writers::SortingWriterOptions {
-                        max_memory_rows: max_mem,
+                        flush_threshold: sorting_parquet_writer::writers::FlushThreshold::Rows(
+                            max_mem,
+                        ),
                         ..Default::default()
                     };
                     let mut writer = SortingParquetWriter::try_new_with_options(
