@@ -1,5 +1,10 @@
 # Sorting Parquet Writer
 
+[![Crates.io Version](https://img.shields.io/crates/v/sorting-parquet-writer)](https://crates.io/crates/sorting-parquet-writer)
+[![docs.rs](https://img.shields.io/docsrs/sorting-parquet-writer)](https://docs.rs/sorting-parquet-writer)
+[![License](https://img.shields.io/crates/l/sorting-parquet-writer)](https://crates.io/crates/sorting-parquet-writer)
+
+
 A Rust library for writing sorted Parquet files with bounded memory usage. Inspired by [Parquet-Go's SortingWriter](https://pkg.go.dev/github.com/parquet-go/parquet-go#SortingWriter).
 
 ## Features
