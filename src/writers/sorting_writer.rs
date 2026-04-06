@@ -13,6 +13,7 @@ use tempfile::TempDir;
 
 use crate::SortingParquetError;
 use crate::record_batch::streaming_merge::{RunInfo, SortedRunMerger};
+use crate::sorting::SortExtremes;
 use crate::writers::progress::{
     FinishPhase, FinishProgress, FinishProgressHandler, NoopProgressHandler,
 };
@@ -113,6 +114,22 @@ pub struct SortingWriterOptions {
     ///
     /// Default: statistics disabled, default compression
     pub run_file_properties: Option<WriterProperties>,
+
+    /// When `true`, each incoming [`RecordBatch`] is sorted individually on
+    /// [`write()`](SortingParquetWriter::write) and the flush phase merges the
+    /// pre-sorted batches with a streaming k-way merge instead of concatenating
+    /// and re-sorting them from scratch.
+    ///
+    /// This trades a small amount of extra work per `write()` call for a
+    /// significantly cheaper flush, because merging already-sorted runs is
+    /// *O(n)* rather than *O(n log n)*.
+    ///
+    /// Enable this when individual batches arrive unsorted and the flush
+    /// buffer typically contains many batches. If each batch is already sorted
+    /// (e.g. coming from a sorted source), only the merge benefit applies.
+    ///
+    /// Default: `false`
+    pub merge_sort_batches: bool,
 }
 
 impl Default for SortingWriterOptions {
@@ -121,6 +138,7 @@ impl Default for SortingWriterOptions {
             flush_threshold: FlushThreshold::Rows(DEFAULT_MAX_MEMORY_ROWS),
             temp_dir: None,
             run_file_properties: None,
+            merge_sort_batches: false,
         }
     }
 }
@@ -247,7 +265,23 @@ impl<W: Write + Send> SortingParquetWriter<W> {
     pub fn write(&mut self, batch: &RecordBatch) -> Result<(), SortingParquetError> {
         self.buffered_rows += batch.num_rows();
         self.buffered_bytes += batch.get_array_memory_size();
-        self.buffer.push(batch.clone());
+        if self.options.merge_sort_batches {
+            let sorting_columns = self
+                .properties
+                .sorting_columns()
+                .ok_or(SortingParquetError::NoSortingColumnsConfigured)?
+                .clone();
+            let sorted_batch = crate::sorting::sort_record_batch_with_row_converter(
+                batch,
+                &sorting_columns,
+                self.row_converter
+                    .as_ref()
+                    .ok_or(SortingParquetError::WriterClosed)?,
+            )?;
+            self.buffer.push(sorted_batch);
+        } else {
+            self.buffer.push(batch.clone());
+        }
 
         if self
             .options
@@ -464,27 +498,43 @@ impl<W: Write + Send> SortingParquetWriter<W> {
         }
         Ok(total)
     }
-
-    /// Sort the in-memory buffer and write it to a new run file.
-    fn flush_to_run(&mut self) -> Result<(), SortingParquetError> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-
+    fn flush_to_run_merge_sort(
+        &mut self,
+    ) -> Result<(RecordBatch, SortExtremes), SortingParquetError> {
         let sorting_columns = self
             .properties
             .sorting_columns()
             .ok_or(SortingParquetError::NoSortingColumnsConfigured)?
             .clone();
+        let (record, (min_sort_key, max_sort_key)) =
+            crate::record_batch::merge_sorted_batches_with_row_converter_returning_extremes(
+                &self.buffer,
+                &sorting_columns,
+                self.row_converter
+                    .as_ref()
+                    .ok_or(SortingParquetError::WriterClosed)?,
+            )?;
+        self.buffer.clear();
+        self.buffered_rows = 0;
+        self.buffered_bytes = 0;
 
+        Ok((record, (min_sort_key, max_sort_key)))
+    }
+
+    fn flush_to_run_concat_and_sort(
+        &mut self,
+    ) -> Result<(RecordBatch, SortExtremes), SortingParquetError> {
+        let sorting_columns = self
+            .properties
+            .sorting_columns()
+            .ok_or(SortingParquetError::NoSortingColumnsConfigured)?
+            .clone();
         // Concatenate all buffered batches, then drop the originals to free memory
         // before the sort creates another copy.
         let combined = arrow::compute::concat_batches(&self.schema, &self.buffer)?;
         self.buffer.clear();
         self.buffered_rows = 0;
         self.buffered_bytes = 0;
-
-        // Sort the combined batch and extract min/max sort keys in one pass
         let (sorted, (min_sort_key, max_sort_key)) =
             crate::sorting::sort_record_batch_with_row_converter_returning_extremes(
                 &combined,
@@ -493,7 +543,20 @@ impl<W: Write + Send> SortingParquetWriter<W> {
                     .as_ref()
                     .ok_or(SortingParquetError::WriterClosed)?,
             )?;
-        drop(combined);
+        Ok((sorted, (min_sort_key, max_sort_key)))
+    }
+    /// Sort the in-memory buffer and write it to a new run file.
+    fn flush_to_run(&mut self) -> Result<(), SortingParquetError> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        // Sort the combined batch and extract min/max sort keys in one pass
+        let (sorted, (min_sort_key, max_sort_key)) = if self.options.merge_sort_batches {
+            self.flush_to_run_merge_sort()?
+        } else {
+            self.flush_to_run_concat_and_sort()?
+        };
 
         // Write to a new run file
         let run_path = self

@@ -12,4 +12,6 @@ pub enum SortingParquetError {
     WriterClosed,
     #[error(transparent)]
     IoError(#[from] std::io::Error),
+    #[error("Unexpected index out of bounds during sorting")]
+    UnexpectedIndexOutOfBounds,
 }

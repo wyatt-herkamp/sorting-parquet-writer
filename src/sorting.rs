@@ -59,7 +59,7 @@ pub fn sort_record_batch_with_row_converter_returning_extremes(
         .collect();
     let rows = row_converter.convert_columns(&columns)?;
     let mut indices: Vec<u32> = (0..batch.num_rows() as u32).collect();
-    indices.sort_by(|&a, &b| unsafe {
+    indices.sort_unstable_by(|&a, &b| unsafe {
         let row_a = rows.row_unchecked(a as usize);
         let row_b = rows.row_unchecked(b as usize);
         row_a.cmp(&row_b)

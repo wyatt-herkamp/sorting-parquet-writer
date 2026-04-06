@@ -1,5 +1,5 @@
 use chrono::{DateTime, Local, NaiveDate, TimeZone as _, Utc};
-use rand::Rng;
+use rand::RngExt;
 
 pub fn random_time_between(start: DateTime<Utc>, end: DateTime<Utc>) -> DateTime<Utc> {
     let duration = end.signed_duration_since(start);

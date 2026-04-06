@@ -5,7 +5,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
 };
 use chrono::{DateTime, Utc};
-use rand::{Rng, seq::IndexedRandom};
+use rand::{RngExt, seq::IndexedRandom};
 
 use crate::test::{
     TestArrowType, TestError,
@@ -13,7 +13,8 @@ use crate::test::{
 };
 const TICKERS: &[&str] = &[
     "AAPL", "GOOG", "MSFT", "AMZN", "TSLA", "META", "NVDA", "NFLX", "ADBE", "INTC", "STLA", "FIG",
-    "KLAR", "WOOF", "GPRO",
+    "KLAR", "WOOF", "GPRO", "GRND", "NVO", "AMD", "CRM", "ORCL", "UBER", "PYPL", "SHOP", "SQ",
+    "SPOT", "SNAP", "ROKU",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -223,7 +224,10 @@ mod tests {
 
     use parquet::arrow::arrow_reader::{ArrowReaderBuilder, ArrowReaderOptions};
 
-    use crate::{test::get_test_dir, writers::SortingParquetWriter};
+    use crate::{
+        test::get_test_dir,
+        writers::{SortingParquetWriter, SortingWriterOptions},
+    };
 
     use super::*;
 
@@ -287,10 +291,98 @@ mod tests {
                 duration_sum_sorted += start.elapsed();
             }
         }
+        let time_to_write_batches = duration_sum_sorted;
+        println!(
+            "Time to write batches (including per-batch sorting): {}",
+            humantime::format_duration(time_to_write_batches)
+        );
+        let start = std::time::Instant::now();
         sorted_writer.finish()?;
         println!(
             "Total sorted write time: {}",
-            humantime::format_duration(duration_sum_sorted)
+            humantime::format_duration(start.elapsed())
+        );
+
+        // Verify sort order directly on Arrow arrays — no TickerItem conversion needed
+        let sorting_columns = TickerItem::sorting_columns();
+        let row_converter =
+            crate::sorting::create_row_converter(&sorting_columns, TickerItem::schema().as_ref())?;
+        let reader = ArrowReaderBuilder::try_new_with_options(
+            std::fs::File::open(&path)?,
+            ArrowReaderOptions::new().with_schema(TickerItem::schema()),
+        )
+        .unwrap()
+        .with_batch_size(65536)
+        .build()?;
+        let mut prev_last_row: Option<Vec<u8>> = None;
+        for batch in reader {
+            let batch = batch?;
+            let cols: Vec<_> = sorting_columns
+                .iter()
+                .map(|col| batch.column(col.column_idx as usize).clone())
+                .collect();
+            let rows = row_converter.convert_columns(&cols)?;
+
+            // Check within batch: each row must be >= previous
+            for i in 1..batch.num_rows() {
+                assert!(
+                    rows.row(i - 1) <= rows.row(i),
+                    "Sort order violation at row {i} within batch"
+                );
+            }
+            // Check across batch boundary
+            if let Some(prev) = &prev_last_row {
+                assert!(
+                    prev.as_slice() <= rows.row(0).as_ref(),
+                    "Sort order violation across batch boundary"
+                );
+            }
+            if batch.num_rows() > 0 {
+                prev_last_row = Some(rows.row(batch.num_rows() - 1).as_ref().to_vec());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_sorted_with_merging() -> anyhow::Result<()> {
+        let path = get_test_dir().join("test_sorted_with_merging.parquet");
+        let file = std::fs::File::create(&path)?;
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_sorting_columns(Some(TickerItem::sorting_columns()))
+            .build();
+        let schema = TickerItem::schema();
+        let mut sorted_writer = SortingParquetWriter::try_new_with_options(
+            file,
+            schema,
+            props,
+            SortingWriterOptions {
+                merge_sort_batches: true,
+                ..Default::default()
+            },
+        )?;
+        let mut duration_sum_sorted = Duration::ZERO;
+
+        for i in 0..50 {
+            eprintln!("Writing batch {}/50", i + 1);
+            let items = TickerItem::random_instances(1024 * 1024);
+            for chunk in items.chunks(8192) {
+                let batch = TickerItem::into_record_batch(chunk)?;
+                let start = std::time::Instant::now();
+                sorted_writer.write(&batch)?;
+                duration_sum_sorted += start.elapsed();
+            }
+        }
+        let time_to_write_batches = duration_sum_sorted;
+        println!(
+            "Time to write batches (including per-batch sorting): {}",
+            humantime::format_duration(time_to_write_batches)
+        );
+        let start = std::time::Instant::now();
+        sorted_writer.finish()?;
+        println!(
+            "Total sorted write time: {}",
+            humantime::format_duration(start.elapsed())
         );
 
         // Verify sort order directly on Arrow arrays — no TickerItem conversion needed

@@ -156,7 +156,7 @@ impl SortedRunMerger {
         let read_batch_size = std::cmp::max(1024, output_batch_size / std::cmp::max(1, num_runs));
 
         // Sort runs by min_sort_key so we can activate them in order
-        run_files.sort_by(|a, b| a.min_sort_key.cmp(&b.min_sort_key));
+        run_files.sort_unstable_by(|a, b| a.min_sort_key.cmp(&b.min_sort_key));
 
         let mut pending_runs: VecDeque<RunInfo> = run_files.into();
         let mut cursors = Vec::with_capacity(num_runs);

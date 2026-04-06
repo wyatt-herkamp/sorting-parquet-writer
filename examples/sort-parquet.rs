@@ -28,7 +28,13 @@ struct Cli {
         help = "Maximum rows to buffer in memory before spilling to disk"
     )]
     pub max_memory_rows: Option<usize>,
-
+    #[arg(
+        long,
+        help = "Maximum memory to use before spilling to disk (e.g. 500MB, 2GB, etc.)"
+    )]
+    pub max_memory_bytes: Option<MemorySize>,
+    #[arg(long, help = "Use merge sort for sorting batches", action = clap::ArgAction::SetTrue)]
+    pub merge_sort: bool,
     pub file: PathBuf,
 }
 
@@ -129,11 +135,36 @@ fn main() -> Result<()> {
     let properties = WriterProperties::builder()
         .set_sorting_columns(Some(sort_columns.clone()))
         .build();
-
+    let flush_threshold = match (cli.max_memory_rows, cli.max_memory_bytes) {
+        (Some(rows), Some(bytes)) => {
+            println!(
+                "Using flush threshold: {} rows or {} bytes (whichever comes first)",
+                rows, bytes.0
+            );
+            FlushThreshold::Either {
+                max_rows: rows,
+                max_bytes: bytes.0,
+            }
+        }
+        (Some(rows), None) => {
+            println!("Using flush threshold: {} rows", rows);
+            FlushThreshold::Rows(rows)
+        }
+        (None, Some(bytes)) => {
+            println!("Using flush threshold: {} bytes", bytes.0);
+            FlushThreshold::Bytes(bytes.0)
+        }
+        (None, None) => {
+            println!("Using default flush threshold: 1,000,000 rows");
+            FlushThreshold::Rows(1_000_000)
+        }
+    };
     let options = SortingWriterOptions {
-        flush_threshold: FlushThreshold::Rows(cli.max_memory_rows.unwrap_or(1_000_000)),
+        flush_threshold,
+        merge_sort_batches: cli.merge_sort,
         ..Default::default()
     };
+    println!("Sorting Writer Options: {:?}", options);
 
     let output_file = std::fs::File::create(&cli.output)
         .with_context(|| format!("Failed to create output file: {}", cli.output.display()))?;
@@ -159,7 +190,7 @@ fn main() -> Result<()> {
     let mut reader = reader_builder
         .build()
         .context("Failed to build parquet reader")?;
-
+    let start = std::time::Instant::now();
     for batch_result in &mut reader {
         let batch = batch_result.context("Failed to read record batch")?;
         let num_rows = batch.num_rows() as u64;
@@ -196,10 +227,11 @@ fn main() -> Result<()> {
 
     let output_size = std::fs::metadata(&cli.output).map(|m| m.len()).unwrap_or(0);
     println!(
-        "\nWrote {} rows to {} ({:.2} MB)",
+        "\nWrote {} rows to {} ({:.2} MB) in {:.2} seconds",
         total_rows,
         cli.output.display(),
-        output_size as f64 / (1024.0 * 1024.0)
+        output_size as f64 / (1024.0 * 1024.0),
+        start.elapsed().as_secs_f64()
     );
 
     Ok(())
@@ -255,4 +287,31 @@ fn convert_sort_columns(
         });
     }
     Ok(result)
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemorySize(pub usize);
+impl FromStr for MemorySize {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim().to_uppercase();
+        let multiplier = if s.ends_with("KB") {
+            1024
+        } else if s.ends_with("MB") {
+            1024 * 1024
+        } else if s.ends_with("GB") {
+            1024 * 1024 * 1024
+        } else if s.ends_with("B") {
+            1
+        } else {
+            return Err(format!("Invalid memory size suffix in '{}'", s));
+        };
+        let num_part = s.trim_end_matches(|c: char| !c.is_ascii_digit()).trim();
+        let num = num_part.parse::<usize>().map_err(|e| {
+            format!(
+                "Failed to parse numeric part of memory size '{}': {}",
+                num_part, e
+            )
+        })?;
+        Ok(MemorySize(num * multiplier))
+    }
 }

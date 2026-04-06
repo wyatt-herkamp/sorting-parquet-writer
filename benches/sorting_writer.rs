@@ -171,6 +171,53 @@ fn bench_sorting_writer(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_sorting_writer_mem_limit(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sorting_writer_mem_limit");
+
+    for &(total_rows, max_mem) in &[
+        (100_000usize, 10 * 1024 * 1024), // 10 MB
+        (100_000, 50 * 1024 * 1024),      // 50 MB
+        (500_000, 50 * 1024 * 1024),      // 50 MB
+        (500_000, 100 * 1024 * 1024),     // 100 MB
+    ] {
+        let batches = generate_batches(total_rows, 1024);
+        let num_runs = total_rows.div_ceil(max_mem);
+
+        group.throughput(Throughput::Elements(total_rows as u64));
+        group.bench_with_input(
+            BenchmarkId::new(format!("{total_rows}_rows/{num_runs}_runs"), max_mem),
+            &batches,
+            |b, batches| {
+                b.iter(|| {
+                    let temp = tempfile::NamedTempFile::new().unwrap();
+                    let file = temp.reopen().unwrap();
+                    let props = WriterProperties::builder()
+                        .set_sorting_columns(Some(sorting_columns()))
+                        .build();
+                    let options = sorting_parquet_writer::writers::SortingWriterOptions {
+                        flush_threshold: sorting_parquet_writer::writers::FlushThreshold::Bytes(
+                            max_mem,
+                        ),
+                        ..Default::default()
+                    };
+                    let mut writer = SortingParquetWriter::try_new_with_options(
+                        file,
+                        create_schema(),
+                        props,
+                        options,
+                    )
+                    .unwrap();
+                    for batch in batches {
+                        writer.write(black_box(batch)).unwrap();
+                    }
+                    writer.finish().unwrap();
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
 // ── Isolated merge phase ────────────────────────────────────────────────────
 
 fn bench_merge_phase(c: &mut Criterion) {
@@ -245,6 +292,7 @@ fn bench_sorted_groups_writer(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    bench_sorting_writer_mem_limit,
     bench_sorting_writer,
     bench_merge_phase,
     bench_sorted_groups_writer

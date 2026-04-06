@@ -6,6 +6,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use crate::SortingParquetError;
+use crate::sorting::SortExtremes;
 pub mod streaming_merge;
 #[derive(Eq)]
 struct HeapItem<'a> {
@@ -139,6 +140,68 @@ pub fn merge_sorted_batches_with_row_converter_unchecked(
     let merged = interleave_record_batch(&batch_refs, &merge_order)?;
     Ok(merged)
 }
+
+pub fn merge_sorted_batches_with_row_converter_returning_extremes(
+    batches: &[RecordBatch],
+    sorting_columns: &[SortingColumn],
+    row_converter: &RowConverter,
+) -> Result<(RecordBatch, SortExtremes), SortingParquetError> {
+    // For each batch, convert the sort columns to rows
+    let mut row_columns = Vec::with_capacity(batches.len());
+    let mut total_rows = 0;
+    for batch in batches {
+        let cols: Vec<ArrayRef> = sorting_columns
+            .iter()
+            .map(|col| batch.column(col.column_idx as usize).clone())
+            .collect();
+        let rows = row_converter.convert_columns(&cols)?;
+        total_rows += batch.num_rows();
+        row_columns.push(rows);
+    }
+
+    let mut heap = BinaryHeap::with_capacity(batches.len());
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        if batch.num_rows() > 0 {
+            heap.push(HeapItem {
+                batch_idx,
+                row_idx: 0,
+                row: row_columns[batch_idx].row(0),
+            });
+        }
+    }
+
+    let mut merge_order: Vec<(usize, usize)> = Vec::with_capacity(total_rows);
+
+    while let Some(HeapItem {
+        batch_idx, row_idx, ..
+    }) = heap.pop()
+    {
+        merge_order.push((batch_idx, row_idx));
+        let next_row_idx = row_idx + 1;
+        if next_row_idx < batches[batch_idx].num_rows() {
+            heap.push(HeapItem {
+                batch_idx,
+                row_idx: next_row_idx,
+                row: row_columns[batch_idx].row(next_row_idx),
+            });
+        }
+    }
+
+    // First entry in merge_order = min, last = max
+    let (min_batch, min_row) = *merge_order
+        .first()
+        .ok_or(SortingParquetError::UnexpectedIndexOutOfBounds)?;
+    let (max_batch, max_row) = *merge_order
+        .last()
+        .ok_or(SortingParquetError::UnexpectedIndexOutOfBounds)?;
+    let min_key = row_columns[min_batch].row(min_row).as_ref().to_vec();
+    let max_key = row_columns[max_batch].row(max_row).as_ref().to_vec();
+
+    let batch_refs: Vec<&RecordBatch> = batches.iter().collect();
+    let merged = interleave_record_batch(&batch_refs, &merge_order)?;
+    Ok((merged, (min_key, max_key)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

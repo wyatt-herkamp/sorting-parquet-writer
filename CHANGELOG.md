@@ -3,6 +3,11 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+## [0.2.0] (UNRELEASED)
+
+### Added
+- Replace sort with sort_unstable
+- Added merge_sort_batches option to SortingParquetWriter for controlling whether to merge sort batches during the merge phase. This can reduce memory usage at the cost of potentially more disk I/O and longer merge times.
 
 ## [0.1.0] - 2026-04-04
 
