@@ -30,6 +30,8 @@ humantime = "2"
 criterion = "0.8"
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.18"
+datafusion = "53"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [[bench]]
 name = "sort_record_batch"
@@ -37,4 +39,8 @@ harness = false
 
 [[bench]]
 name = "sorting_writer"
+harness = false
+
+[[bench]]
+name = "datafusion_comparison"
 harness = false
