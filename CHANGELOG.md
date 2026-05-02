@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+## [0.3.0] (UNRELEASED)
+
+### Added
+- Improve Documentation
+- Add Check for Empty Batches in SortingParquetWriter::write() to avoid unnecessary flushes and potential schema mismatches when empty batches are written.
+- Add Schema Validation in SortingParquetWriter::write() to ensure that the schema of incoming batches matches the writer's schema, preventing runtime errors during sorting and merging.
+
 ## [0.2.0] (2026-05-02)
 
 ### Added

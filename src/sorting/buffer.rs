@@ -1,8 +1,21 @@
+//! A row-count-bounded staging buffer used by
+//! [`SortedGroupsParquetWriter`](crate::writers::SortedGroupsParquetWriter)
+//! to collect pre-sorted batches into row-group-sized chunks before merging.
+
 use std::mem;
 
 use arrow::array::RecordBatch;
 
 use crate::utils::split_batch;
+
+/// A FIFO buffer of [`RecordBatch`]es that emits a batch of batches as soon as
+/// the total row count reaches `maximum_rows_per_group`.
+///
+/// Batches are kept in insertion order and never reordered. The buffer is
+/// agnostic to whether batches are sorted — that's the caller's responsibility.
+/// Used by [`SortedGroupsParquetWriter`](crate::writers::SortedGroupsParquetWriter)
+/// to assemble exactly-sized row groups whose constituent batches are
+/// individually sorted and ready to be merged.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SortingBuffer {
     buffer: Vec<RecordBatch>,
@@ -10,7 +23,8 @@ pub struct SortingBuffer {
     maximum_rows_per_group: usize,
 }
 impl SortingBuffer {
-    /// Creates a new SortingBuffer with the specified maximum number of rows per group.
+    /// Creates an empty buffer that will emit a group every
+    /// `maximum_rows_per_group` rows.
     pub fn new(maximum_rows_per_group: usize) -> Self {
         Self {
             buffer: Vec::new(),
@@ -18,7 +32,17 @@ impl SortingBuffer {
             maximum_rows_per_group,
         }
     }
-    /// Adds a RecordBatch to the buffer and updates the total number of rows.
+
+    /// Appends `batch` to the buffer.
+    ///
+    /// If the buffer's row count reaches `maximum_rows_per_group`, returns
+    /// `Some(group)` where `group` contains the previously buffered batches
+    /// followed by the prefix of `batch` needed to hit the limit exactly. Any
+    /// excess rows in `batch` are split off (zero-copy via [`RecordBatch::slice`])
+    /// and remain buffered to seed the next group.
+    ///
+    /// Returns `None` if the limit was not reached, in which case `batch` is
+    /// retained in full.
     pub fn add_batch(&mut self, batch: RecordBatch) -> Option<Vec<RecordBatch>> {
         let new_total_rows = self.num_rows + batch.num_rows();
         if new_total_rows >= self.maximum_rows_per_group {
@@ -37,7 +61,8 @@ impl SortingBuffer {
         None
     }
 
-    /// Flushes the current buffer, returning all buffered RecordBatches and clearing the buffer.
+    /// Drains the buffer, returning all currently held batches and resetting
+    /// the row count to zero. Returns `None` if the buffer was empty.
     pub fn flush(&mut self) -> Option<Vec<RecordBatch>> {
         if self.buffer.is_empty() {
             None

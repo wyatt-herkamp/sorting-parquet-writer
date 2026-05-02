@@ -1,5 +1,16 @@
+//! Small batch-manipulation helpers shared across the writers.
+
 use arrow::array::RecordBatch;
 
+/// Splits a [`RecordBatch`] at `at_row`, returning `(left, right)` where `left`
+/// holds rows `[0, at_row)` and `right` holds rows `[at_row, num_rows)`.
+///
+/// The split is zero-copy: both returned batches share the original
+/// Arc-backed columns via [`RecordBatch::slice`].
+///
+/// If `at_row >= batch.num_rows()` the split is clamped — `left` is a clone of
+/// the full batch and `right` is an empty batch with the same schema. In
+/// particular, `at_row == 0` yields an empty `left` and a full-batch `right`.
 pub fn split_batch(batch: &RecordBatch, at_row: usize) -> (RecordBatch, RecordBatch) {
     let total_rows = batch.num_rows();
     if total_rows <= at_row {

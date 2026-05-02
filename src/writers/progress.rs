@@ -14,12 +14,19 @@ pub struct FinishProgress {
     pub num_runs: usize,
 }
 
-/// The current phase of the finish operation.
+/// Which phase of the finalize step is currently making progress.
+///
+/// [`SortingParquetWriter::finish_with_progress`](crate::writers::SortingParquetWriter::finish_with_progress)
+/// picks one of these branches based on how many sorted run files were
+/// produced during the write phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishPhase {
-    /// Copying through a single sorted run (no merge needed).
+    /// Exactly one sorted run exists, so its rows are copied straight
+    /// into the target writer with no merge step.
     CopyThrough,
-    /// Merging multiple sorted runs via k-way merge.
+    /// Two or more sorted runs are being combined via the streaming
+    /// k-way merge implemented by
+    /// [`SortedRunMerger`](crate::record_batch::streaming_merge::SortedRunMerger).
     Merging,
 }
 
@@ -63,7 +70,10 @@ impl<F: FnMut(&FinishProgress)> FinishProgressHandler for F {
     }
 }
 
-/// No-op handler that gets optimized away entirely.
+/// Sentinel handler used by
+/// [`SortingParquetWriter::finish`](crate::writers::SortingParquetWriter::finish)
+/// when the caller doesn't supply a progress callback. Every call is a no-op
+/// and gets inlined away.
 pub(crate) struct NoopProgressHandler;
 
 impl FinishProgressHandler for NoopProgressHandler {

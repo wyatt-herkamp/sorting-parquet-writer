@@ -1,3 +1,27 @@
+//! In-memory k-way merge of pre-sorted [`RecordBatch`]es.
+//!
+//! Each batch in the input must already be sorted by the supplied
+//! [`SortingColumn`]s. The merge uses a binary min-heap over the head row of
+//! every non-empty batch and assembles the merged output in one pass via
+//! [`arrow::compute::interleave_record_batch`].
+//!
+//! Variants:
+//!
+//! - [`merge_sorted_batches`] — convenience wrapper that builds a fresh
+//!   [`RowConverter`] and validates schemas.
+//! - [`merge_sorted_batches_with_row_converter`] — same, but reuses a
+//!   pre-built converter.
+//! - [`merge_sorted_batches_with_row_converter_unchecked`] — skips the
+//!   schema-equality check; intended for internal callers that have already
+//!   established the invariant (e.g. all batches came from the same writer).
+//! - [`merge_sorted_batches_with_row_converter_returning_extremes`] — same as
+//!   the unchecked variant but additionally returns the encoded min and max
+//!   sort keys for use as a [`RunInfo`](streaming_merge::RunInfo) range.
+//!
+//! For the file-backed merge across spilled run files used by
+//! [`SortingParquetWriter`](crate::writers::SortingParquetWriter), see the
+//! [`streaming_merge`] submodule.
+
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::compute::interleave_record_batch;
 use arrow_row::{RowConverter, SortField};
@@ -29,7 +53,18 @@ impl<'a> PartialEq for HeapItem<'a> {
         self.row == other.row
     }
 }
-///  Merges multiple sorted RecordBatches into a single sorted RecordBatch based on the specified sorting columns.
+/// Merges multiple already-sorted [`RecordBatch`]es into a single sorted
+/// [`RecordBatch`] over the same sort key.
+///
+/// Builds a fresh [`RowConverter`] from the first batch's schema and
+/// `sorting_columns`. Prefer
+/// [`merge_sorted_batches_with_row_converter`] when merging repeatedly with
+/// the same schema.
+///
+/// # Errors
+///
+/// Returns an error if `batches` is empty, if the batches do not all share a
+/// schema, or if row encoding / interleaving fails.
 pub fn merge_sorted_batches(
     batches: &[RecordBatch],
     sorting_columns: &[SortingColumn],
@@ -67,6 +102,17 @@ pub fn merge_sorted_batches(
 
     merge_sorted_batches_with_row_converter(batches, sorting_columns, &row_converter)
 }
+
+/// Like [`merge_sorted_batches`], but reuses a caller-supplied
+/// [`RowConverter`] instead of building one each call.
+///
+/// Validates that every batch has the same schema before delegating to
+/// [`merge_sorted_batches_with_row_converter_unchecked`].
+///
+/// # Errors
+///
+/// Returns an error if `batches` is empty, the schemas don't match, or row
+/// encoding / interleaving fails.
 pub fn merge_sorted_batches_with_row_converter(
     batches: &[RecordBatch],
     sorting_columns: &[SortingColumn],
@@ -90,6 +136,18 @@ pub fn merge_sorted_batches_with_row_converter(
 
     merge_sorted_batches_with_row_converter_unchecked(batches, sorting_columns, row_converter)
 }
+
+/// Merges sorted batches without checking that all schemas match.
+///
+/// The caller is responsible for ensuring every batch in `batches` has a
+/// schema that matches `row_converter`'s expectations and that each batch is
+/// already sorted by `sorting_columns`. Empty batches are skipped from the
+/// heap.
+///
+/// Used internally by callers that have already established these invariants
+/// — for example,
+/// [`SortedGroupsParquetWriter`](crate::writers::SortedGroupsParquetWriter)
+/// pre-sorts each batch and shares the writer's schema across all of them.
 pub fn merge_sorted_batches_with_row_converter_unchecked(
     batches: &[RecordBatch],
     sorting_columns: &[SortingColumn],
@@ -141,6 +199,26 @@ pub fn merge_sorted_batches_with_row_converter_unchecked(
     Ok(merged)
 }
 
+/// Merges sorted batches and additionally returns the encoded min and max
+/// sort keys of the merged result.
+///
+/// Equivalent in merge logic to
+/// [`merge_sorted_batches_with_row_converter_unchecked`]. The min/max are
+/// taken from the first and last entries of the merge order, avoiding a
+/// second [`RowConverter::convert_columns`] pass.
+///
+/// Used by
+/// [`SortingParquetWriter`](crate::writers::SortingParquetWriter) when
+/// `merge_sort_batches` is enabled, so each spilled run file can be tagged
+/// with its sort-key range for the lazy-activation step in
+/// [`SortedRunMerger`](streaming_merge::SortedRunMerger).
+///
+/// # Errors
+///
+/// Returns [`SortingParquetError::UnexpectedIndexOutOfBounds`] when every
+/// input batch is empty (and so the merge produces no rows from which to
+/// extract a min/max). Other errors are propagated from row encoding or
+/// [`interleave_record_batch`].
 pub fn merge_sorted_batches_with_row_converter_returning_extremes(
     batches: &[RecordBatch],
     sorting_columns: &[SortingColumn],

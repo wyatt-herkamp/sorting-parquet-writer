@@ -1,3 +1,22 @@
+//! Streaming k-way merge across sorted Parquet run files on disk.
+//!
+//! Used by [`SortingParquetWriter`](crate::writers::SortingParquetWriter)
+//! during the finalize phase to combine its spilled run files into a single
+//! globally sorted output.
+//!
+//! # Lazy activation
+//!
+//! Each run file carries its sort-key range as a [`RunInfo`]. Pending runs
+//! are kept in a queue ordered by `min_sort_key` ascending, and a run is
+//! opened only once the current heap minimum has caught up to its
+//! `min_sort_key`. When run ranges are disjoint, this means the merger
+//! holds at most one open file at a time; when ranges overlap, it
+//! activates as many runs as needed to maintain a correct global order.
+//!
+//! Each open run reads one [`RecordBatch`] at a time from its file via
+//! [`ParquetRecordBatchReader`], so total memory is bounded by approximately
+//! one batch per active run plus the in-flight output batch.
+
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
 use std::fs::File;
@@ -13,13 +32,22 @@ use parquet::file::metadata::SortingColumn;
 
 use crate::SortingParquetError;
 
-/// Metadata about a sorted run file, including its sort key range.
-/// Used for lazy activation — runs are only opened when the merge
-/// position reaches their `min_sort_key`.
+/// A handle to one sorted Parquet run file produced by the writer's spill phase.
+///
+/// `min_sort_key` and `max_sort_key` are the encoded [`arrow_row`] bytes of
+/// the first and last sort keys in the run, respectively. They are populated when the run is written and consumed by
+/// [`SortedRunMerger`] to drive lazy activation: a run is held back until the
+/// current merge position reaches its `min_sort_key`.
+///
+/// The keys are wrapped in [`Arc`] so the merger can sort by them without
+/// cloning the underlying byte vectors.
 #[derive(Clone)]
 pub struct RunInfo {
+    /// Filesystem path of the sorted Parquet run file.
     pub path: PathBuf,
+    /// Encoded sort key of the first row in the run.
     pub min_sort_key: Arc<Vec<u8>>,
+    /// Encoded sort key of the last row in the run.
     pub max_sort_key: Arc<Vec<u8>>,
 }
 
@@ -67,6 +95,9 @@ impl RunCursor {
     fn fill_sort_key(&self, buf: &mut Vec<u8>) -> bool {
         if let Some(rows) = &self.current_rows {
             buf.clear();
+            // SAFETY: `row_idx` was set to 0 on batch load and only advanced
+            // after a `next_row_idx < current_batch_num_rows()` check, so it
+            // is always a valid row index for `rows`.
             buf.extend_from_slice(unsafe { rows.row_unchecked(self.row_idx) }.as_ref());
             true
         } else {
@@ -119,13 +150,17 @@ fn convert_rows(
 
 /// Streams merged, globally-sorted output from multiple sorted Parquet run files.
 ///
-/// Uses a k-way merge with a binary heap. Each call to `next_batch()` produces
-/// up to `output_batch_size` rows by popping from the heap and assembling the
-/// result via `arrow::compute::interleave_record_batch`.
+/// Implements a k-way merge with a binary min-heap keyed on the encoded
+/// sort-key bytes of the head row of each active run. Each call to
+/// [`next_batch`](Self::next_batch) produces up to `output_batch_size` rows
+/// by repeatedly popping the heap, recording the `(batch, row)` of the
+/// smallest sort key, and pushing the next row from the same run. The
+/// output is assembled in one shot via
+/// [`arrow::compute::interleave_record_batch`].
 ///
-/// Runs are lazily activated: only runs whose `min_sort_key` has been reached
-/// by the current merge position are opened. This reduces concurrent file handles
-/// and memory when runs have limited overlap.
+/// Pending runs are activated lazily based on their [`RunInfo::min_sort_key`]
+/// (see the module-level docs). Implements [`Iterator`] so the merger can be
+/// driven by a `for` loop or the standard combinators.
 pub struct SortedRunMerger {
     /// Active runs with open readers participating in the merge.
     cursors: Vec<RunCursor>,
@@ -140,10 +175,18 @@ pub struct SortedRunMerger {
 }
 
 impl SortedRunMerger {
-    /// Create a new merger over the given sorted run files.
+    /// Builds a merger over the given sorted run files.
     ///
-    /// Runs are lazily activated based on their `min_sort_key` — only runs
-    /// whose data range overlaps the current merge position are opened.
+    /// `output_batch_size` is the maximum row count of each batch returned
+    /// by [`next_batch`](Self::next_batch); the merger picks an internal
+    /// per-run read batch size based on it and the run count to bound the
+    /// total memory across all active cursors.
+    ///
+    /// `run_files` is sorted by [`RunInfo::min_sort_key`] internally; callers
+    /// do not need to pre-sort. The first run plus any others sharing the
+    /// same `min_sort_key` are opened eagerly so the heap has at least one
+    /// entry before the first call to `next_batch`. If `run_files` is empty,
+    /// the resulting merger yields `Ok(None)` on the first `next_batch`.
     pub fn try_new(
         mut run_files: Vec<RunInfo>,
         sorting_columns: Vec<SortingColumn>,
@@ -258,8 +301,14 @@ impl SortedRunMerger {
         }
     }
 
-    /// Produce the next output batch of up to `output_batch_size` sorted rows.
-    /// Returns `None` when all runs are exhausted.
+    /// Produces the next merged batch of up to `output_batch_size` rows in
+    /// global sort order, or `Ok(None)` once every run (active and pending)
+    /// is exhausted.
+    ///
+    /// Activates any pending runs whose `min_sort_key` has been reached by
+    /// the current heap minimum before each pop, so overlapping runs are
+    /// joined into the merge at the correct point. Empty run files
+    /// encountered during activation are skipped silently.
     pub fn next_batch(&mut self) -> Result<Option<RecordBatch>, SortingParquetError> {
         if self.heap.is_empty() && self.pending_runs.is_empty() {
             return Ok(None);
@@ -404,6 +453,11 @@ impl SortedRunMerger {
     }
 }
 
+/// Streams batches from the merger via [`Iterator`].
+///
+/// Yields `Some(Ok(batch))` while data remains, `Some(Err(_))` if a merge
+/// step fails, and `None` after all runs are exhausted. After an `Err` is
+/// returned the merger should not be polled again.
 impl Iterator for SortedRunMerger {
     type Item = Result<RecordBatch, SortingParquetError>;
 

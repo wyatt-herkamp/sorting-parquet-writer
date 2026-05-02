@@ -11,11 +11,24 @@ use crate::{
 /// Default maximum row group size when not explicitly configured (matches parquet 56 behavior).
 const DEFAULT_MAX_ROW_GROUP_SIZE: usize = 1024 * 1024;
 
-/// A Parquet Writer that sorts the individual Row Groups based on the provided sorting columns.
+/// A Parquet writer that sorts each row group independently.
 ///
-/// This will not result in a globally sorted Parquet File. But the individual Row Groups will be sorted.
+/// In contrast to
+/// [`SortingParquetWriter`](crate::writers::SortingParquetWriter), this
+/// writer produces a Parquet file whose **row groups are individually
+/// sorted** but whose rows are not globally ordered. There is no spill
+/// phase: each incoming batch is sorted, buffered in a [`SortingBuffer`]
+/// until it fills a row group, then merged with its neighbors and written
+/// directly to the output.
 ///
-/// This can create a Parquet file that is more efficient to read but it will not be as efficient as a fully sorted Parquet file.
+/// Use this writer when:
+///
+/// - The reading workload primarily filters within a row group (Parquet's
+///   row-group statistics still allow efficient pruning), and
+/// - The cost of an external merge sort is not justified.
+///
+/// Use [`SortingParquetWriter`](crate::writers::SortingParquetWriter)
+/// instead when you need a globally sorted file.
 pub struct SortedGroupsParquetWriter<W: Write + Send> {
     schema: SchemaRef,
     buffer: SortingBuffer,
@@ -24,6 +37,18 @@ pub struct SortedGroupsParquetWriter<W: Write + Send> {
     row_converter: arrow_row::RowConverter,
 }
 impl<W: Write + Send> SortedGroupsParquetWriter<W> {
+    /// Creates a new writer wrapping `writer`.
+    ///
+    /// The row group size is taken from
+    /// [`WriterProperties::max_row_group_row_count`], falling back to a 1M
+    /// row default. `properties` must have sorting columns configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SortingParquetError::NoSortingColumnsConfigured`] if
+    /// `properties` does not have sorting columns set, or any error
+    /// surfaced from constructing the inner [`ArrowWriter`] or
+    /// [`RowConverter`](arrow_row::RowConverter).
     pub fn try_new(
         writer: W,
         schema: SchemaRef,
@@ -58,13 +83,21 @@ impl<W: Write + Send> SortedGroupsParquetWriter<W> {
             .sorting_columns()
             .ok_or(SortingParquetError::NoSortingColumnsConfigured)
     }
-    /// Writes a RecordBatch to the Parquet file, sorting it based on the configured sorting columns.
+    /// Sorts `batch` and buffers it until enough rows have accumulated to
+    /// emit a full row group.
     ///
-    /// Each Batch will be sorted and then buffered until the configured maximum Row Group size is reached.
-    /// At that point, the buffered batches will be merged and written as a single Row Group
+    /// Each call sorts `batch` against the writer's sorting columns and
+    /// hands the sorted batch to the [`SortingBuffer`]. Once the buffer
+    /// reaches the configured row-group size it is merged via
+    /// [`merge_sorted_batches_with_row_converter_unchecked`](crate::record_batch::merge_sorted_batches_with_row_converter_unchecked)
+    /// — the unchecked variant is sound here because every batch in the
+    /// buffer is sorted by this writer and shares the writer's schema —
+    /// and written to the underlying [`ArrowWriter`] as one row group.
     ///
-    /// See: [ArrowWriter::write](parquet::arrow::ArrowWriter::write)
+    /// # Errors
     ///
+    /// Returns an error if `batch.schema()` does not match the writer's
+    /// schema, or if sorting / merging / writing fails.
     pub fn write(&mut self, batch: &RecordBatch) -> Result<(), SortingParquetError> {
         if !batch.schema().as_ref().eq(self.schema.as_ref()) {
             return Err(SortingParquetError::ArrowError(
@@ -114,17 +147,31 @@ impl<W: Write + Send> SortedGroupsParquetWriter<W> {
         Ok(())
     }
 
+    /// Flushes any buffered data and consumes the writer, returning the
+    /// underlying [`ArrowWriter`] without closing it.
+    ///
+    /// Use this when you want to interleave additional non-sorted writes
+    /// with the inner [`ArrowWriter`] before closing it. The Parquet
+    /// footer is still written when the [`ArrowWriter`] is closed.
     pub fn into_inner(mut self) -> Result<ArrowWriter<W>, SortingParquetError> {
         self.flush()?;
         Ok(self.inner)
     }
 
+    /// Flushes any buffered data, closes the inner [`ArrowWriter`] (which
+    /// writes the Parquet footer), and returns the underlying writer `W`.
     pub fn into_inner_writer(self) -> Result<W, SortingParquetError> {
         Ok(self.into_inner()?.into_inner()?)
     }
+
+    /// Returns a reference to the [`WriterProperties`] this writer was
+    /// constructed with.
     pub fn writer_properties(&self) -> &WriterProperties {
         &self.properties
     }
+
+    /// Returns a reference to the Arrow schema this writer enforces on
+    /// every incoming batch.
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
     }

@@ -35,6 +35,8 @@ struct Cli {
     pub max_memory_bytes: Option<MemorySize>,
     #[arg(long, help = "Use merge sort for sorting batches", action = clap::ArgAction::SetTrue)]
     pub merge_sort: bool,
+    /// Input file path. Must be a Parquet file.
+    #[arg(help = "Path to the Parquet file to sort")]
     pub file: PathBuf,
 }
 

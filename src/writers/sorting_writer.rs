@@ -8,7 +8,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tempfile::TempDir;
 
 use crate::SortingParquetError;
@@ -120,13 +120,22 @@ pub struct SortingWriterOptions {
     /// pre-sorted batches with a streaming k-way merge instead of concatenating
     /// and re-sorting them from scratch.
     ///
-    /// This trades a small amount of extra work per `write()` call for a
-    /// significantly cheaper flush, because merging already-sorted runs is
-    /// *O(n)* rather than *O(n log n)*.
+    /// This trades a per-batch sort cost on the write path for a cheaper
+    /// flush:
     ///
-    /// Enable this when individual batches arrive unsorted and the flush
-    /// buffer typically contains many batches. If each batch is already sorted
-    /// (e.g. coming from a sorted source), only the merge benefit applies.
+    /// - With `merge_sort_batches = false` (default), `flush_to_run`
+    ///   concatenates every buffered batch and runs one *O(n log n)* sort
+    ///   over the result. Peak memory transiently holds both the
+    ///   concatenated input and the sorted output.
+    /// - With `merge_sort_batches = true`, each `write()` does an *O(b log b)*
+    ///   sort on its own batch (size `b`) and the flush is an *O(n)* k-way
+    ///   merge that streams across the already-sorted batches. The
+    ///   concatenation copy is avoided.
+    ///
+    /// Enable this when batches arrive unsorted and the flush buffer holds
+    /// many batches; the per-batch sort amortizes well against a much
+    /// cheaper flush. If batches are already sorted at the source, only the
+    /// merge benefit applies.
     ///
     /// Default: `false`
     pub merge_sort_batches: bool,
@@ -263,6 +272,16 @@ impl<W: Write + Send> SortingParquetWriter<W> {
     /// temporary run files on disk when the configured [`FlushThreshold`] is reached.
     /// The batch schema must match the schema provided at construction.
     pub fn write(&mut self, batch: &RecordBatch) -> Result<(), SortingParquetError> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        if batch.schema_ref() != &self.schema {
+            return Err(SortingParquetError::ArrowError(
+                arrow::error::ArrowError::SchemaError(
+                    "Batch schema does not match writer schema".to_string(),
+                ),
+            ));
+        }
         self.buffered_rows += batch.num_rows();
         self.buffered_bytes += batch.get_array_memory_size();
         if self.options.merge_sort_batches {
@@ -297,8 +316,8 @@ impl<W: Write + Send> SortingParquetWriter<W> {
     ///
     /// This can be used to control memory usage externally (e.g., based on
     /// system memory pressure) regardless of the configured [`FlushThreshold`].
-    ///
-    /// This is a no-op if the buffer is empty.
+    /// A no-op if the buffer is empty (in particular, calling it twice in a
+    /// row produces only one run file).
     pub fn flush_buffer(&mut self) -> Result<(), SortingParquetError> {
         self.flush_to_run()
     }
@@ -488,7 +507,12 @@ impl<W: Write + Send> SortingParquetWriter<W> {
 
     // ── Internal ────────────────────────────────────────────────────────
 
-    /// Sum the row counts from all run file Parquet metadata.
+    /// Sum the row counts from all run-file Parquet metadata.
+    ///
+    /// Called once before the multi-run merge so the [`FinishProgress`]
+    /// reported via [`finish_with_progress`](Self::finish_with_progress) has
+    /// a fixed denominator (`total_rows`). Reads only the footers, not the
+    /// row data.
     fn read_total_rows(&self) -> Result<u64, SortingParquetError> {
         let mut total = 0u64;
         for run in &self.run_files {
@@ -546,6 +570,12 @@ impl<W: Write + Send> SortingParquetWriter<W> {
         Ok((sorted, (min_sort_key, max_sort_key)))
     }
     /// Sort the in-memory buffer and write it to a new run file.
+    ///
+    /// Picks between the two flush strategies based on
+    /// [`SortingWriterOptions::merge_sort_batches`] and tags the resulting
+    /// run with its min/max sort keys so
+    /// [`SortedRunMerger`](crate::record_batch::streaming_merge::SortedRunMerger)
+    /// can lazily activate runs by range during the final merge.
     fn flush_to_run(&mut self) -> Result<(), SortingParquetError> {
         if self.buffer.is_empty() {
             return Ok(());
@@ -568,7 +598,7 @@ impl<W: Write + Send> SortingParquetWriter<W> {
         let run_file_props = self.options.run_file_properties.clone().unwrap_or_else(|| {
             WriterProperties::builder()
                 .set_write_page_header_statistics(false)
-                .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
+                .set_statistics_enabled(EnabledStatistics::None)
                 .build()
         });
 

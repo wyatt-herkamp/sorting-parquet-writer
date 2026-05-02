@@ -23,6 +23,12 @@
 //! [`writers::SortingParquetWriter::finish_with_progress`] accepts any
 //! [`writers::FinishProgressHandler`] (including closures) for monitoring the merge phase.
 //!
+//! ## Errors
+//!
+//! All fallible APIs return [`SortingParquetError`], which transparently
+//! wraps Arrow, Parquet, and `std::io::Error`s alongside a few crate-specific
+//! variants.
+//!
 //! ## Example
 //!
 //! ```rust,no_run

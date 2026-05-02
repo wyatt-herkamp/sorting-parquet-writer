@@ -22,6 +22,7 @@ struct Cli {
         help = "Sorting columns in the format: column_name:asc|desc:nulls_first (e.g. timestamp:asc:true)"
     )]
     pub sort_columns: Vec<SortColumnArg>,
+    #[arg(help = "Path to the Parquet file to check")]
     pub file: PathBuf,
 }
 
