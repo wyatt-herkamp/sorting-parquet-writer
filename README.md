@@ -120,9 +120,6 @@ cargo run --example sort-checker -- \
   input.parquet
 ```
 
-## Limitations
-
-- Only supports int, uint, float, bool, string, and list types. Other Arrow types will produce an error during the merge process.
 
 ## License
 
