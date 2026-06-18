@@ -13,7 +13,7 @@ readme = "README.md"
 arrow = { version = "58", default-features = false }
 arrow-schema = "58"
 arrow-row = "58"
-parquet = { version = "58", default-features = false }
+parquet = { version = "58", features = ["arrow"], default-features = false }
 thiserror = "2"
 
 tempfile = "3"
