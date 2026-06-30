@@ -10,6 +10,7 @@ A Rust library for writing sorted Parquet files with bounded memory usage. Inspi
 ## Features
 
 - **Globally sorted output** via external merge sort (`SortingParquetWriter`)
+- **Async / concurrent spilling** — same external merge sort, but spills run on background Tokio tasks (`ConcurrentSortingParquetWriter`)
 - **Per-row-group sorting** for lighter-weight optimization (`SortedGroupsParquetWriter`)
 - **Bounded memory** — configurable row buffer with automatic spill to temporary run files
 - **Streaming k-way merge** — final merge reads one batch per run file at a time
@@ -89,6 +90,29 @@ writer.finish_with_progress(|p: &FinishProgress| {
 }).unwrap();
 # }
 ```
+
+### `ConcurrentSortingParquetWriter`
+
+The `async` counterpart of `SortingParquetWriter`, for use inside a Tokio runtime. It uses the same external merge sort and accepts the same `SortingWriterOptions`, but each spill (sort + run-file write) is offloaded to a background `tokio::task::spawn_blocking` task — so the caller can keep buffering the next batch while previous runs are still being written.
+
+```rust
+use sorting_parquet_writer::writers::{ConcurrentSortingParquetWriter, BackgroundWorker};
+use std::num::NonZeroUsize;
+
+# async fn example(file: std::fs::File, schema: arrow::datatypes::SchemaRef, props: parquet::file::properties::WriterProperties) -> Result<(), Box<dyn std::error::Error>> {
+// `BackgroundWorker` bounds how many spills run at once (default: 4). Each
+// in-flight spill holds a buffer's worth of rows, so this caps peak memory.
+let background = BackgroundWorker {
+    max_concurrent_workers: NonZeroUsize::new(4),
+};
+let mut writer = ConcurrentSortingParquetWriter::try_new(file, schema, props)?;
+// writer.write(&batch).await?;
+let file = writer.finish().await?;
+# Ok(())
+# }
+```
+
+The methods (`write`, `flush_buffer`, `finish`, `finish_with_progress`) are all `async`. A spill error surfaces the next time a task is awaited — during back-pressure in a later `write`, during `wait_for_background_tasks`, or during `finish`.
 
 ### `SortedGroupsParquetWriter`
 

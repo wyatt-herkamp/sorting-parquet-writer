@@ -2823,11 +2823,13 @@ dependencies = [
  "datafusion",
  "humantime",
  "indicatif",
+ "parking_lot",
  "parquet",
  "rand 0.10.1",
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

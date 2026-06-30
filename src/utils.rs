@@ -1,5 +1,7 @@
 //! Small batch-manipulation helpers shared across the writers.
 
+use std::{ops::Deref, sync::Arc};
+
 use arrow::array::RecordBatch;
 
 /// Splits a [`RecordBatch`] at `at_row`, returning `(left, right)` where `left`
@@ -19,6 +21,35 @@ pub fn split_batch(batch: &RecordBatch, at_row: usize) -> (RecordBatch, RecordBa
     let left_batch = batch.slice(0, at_row);
     let right_batch = batch.slice(at_row, total_rows - at_row);
     (left_batch, right_batch)
+}
+pub enum ArcCow<T> {
+    Borrowed(Arc<T>),
+    Owned(T),
+}
+impl<T> ArcCow<T> {
+    pub fn as_ref(&self) -> &T {
+        match self {
+            ArcCow::Borrowed(arc) => arc.as_ref(),
+            ArcCow::Owned(value) => value,
+        }
+    }
+}
+impl<T> From<Arc<T>> for ArcCow<T> {
+    fn from(arc: Arc<T>) -> Self {
+        ArcCow::Borrowed(arc)
+    }
+}
+impl<T> From<T> for ArcCow<T> {
+    fn from(value: T) -> Self {
+        ArcCow::Owned(value)
+    }
+}
+impl<T> Deref for ArcCow<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
 }
 
 #[cfg(test)]
