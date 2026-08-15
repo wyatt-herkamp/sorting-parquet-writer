@@ -18,10 +18,19 @@
 //!   by the given sorting columns.
 //! - [`record_batch::merge_sorted_batches`] — k-way merge of pre-sorted batches into one.
 //!
+//! ## Run compaction
+//!
+//! For writers that run long enough to spill many *overlapping* runs, the
+//! [`writers::compaction`] module merges them back down so the final merge
+//! stays cheap. Work is packaged as a `Send + 'static`
+//! [`writers::CompactionJob`], so it can run on another thread without this
+//! crate depending on an async runtime.
+//!
 //! ## Progress tracking
 //!
 //! [`writers::SortingParquetWriter::finish_with_progress`] accepts any
 //! [`writers::FinishProgressHandler`] (including closures) for monitoring the merge phase.
+//! [`writers::CompactionProgressHandler`] does the same for compaction.
 //!
 //! ## Errors
 //!

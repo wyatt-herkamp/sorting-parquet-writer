@@ -38,6 +38,21 @@ pub enum SortingParquetError {
     #[error(transparent)]
     IoError(#[from] io::Error),
 
+    /// Returned by
+    /// [`finish`](crate::writers::SortingParquetWriter::finish) when a
+    /// compaction job taken via
+    /// [`take_compaction_job`](crate::writers::SortingParquetWriter::take_compaction_job)
+    /// has not yet been given back to the writer.
+    ///
+    /// The runs held by an outstanding job are not tracked by the writer, so
+    /// finishing would silently drop them. Call
+    /// [`apply_compaction`](crate::writers::SortingParquetWriter::apply_compaction)
+    /// or
+    /// [`abandon_compaction`](crate::writers::SortingParquetWriter::abandon_compaction)
+    /// for every outstanding job first.
+    #[error("{0} compaction job(s) still in flight; apply or abandon them before finishing")]
+    CompactionInFlight(usize),
+
     /// An internal invariant was violated while computing min/max sort keys
     /// for a merged batch.
     ///

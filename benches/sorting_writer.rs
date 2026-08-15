@@ -7,7 +7,9 @@ use parquet::file::properties::WriterProperties;
 use rand::prelude::*;
 use sorting_parquet_writer::record_batch::streaming_merge::{RunInfo, SortedRunMerger};
 use sorting_parquet_writer::sorting::{create_row_converter, sort_record_batch};
-use sorting_parquet_writer::writers::{SortedGroupsParquetWriter, SortingParquetWriter};
+use sorting_parquet_writer::writers::{
+    CompactionPolicy, SortedGroupsParquetWriter, SortingParquetWriter, SortingWriterOptions,
+};
 use std::hint::black_box;
 use std::sync::Arc;
 
@@ -112,10 +114,13 @@ fn create_sorted_run_files(
         let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
         writer.write(&sorted).unwrap();
         writer.close().unwrap();
+        let file_size = std::fs::metadata(&path).unwrap().len();
         runs.push(RunInfo {
             path,
             min_sort_key: Arc::new(min_sort_key),
             max_sort_key: Arc::new(max_sort_key),
+            num_rows: sorted.num_rows() as u64,
+            file_size,
         });
     }
 
@@ -147,12 +152,9 @@ fn bench_sorting_writer(c: &mut Criterion) {
                     let props = WriterProperties::builder()
                         .set_sorting_columns(Some(sorting_columns()))
                         .build();
-                    let options = sorting_parquet_writer::writers::SortingWriterOptions {
-                        flush_threshold: sorting_parquet_writer::writers::FlushThreshold::Rows(
-                            max_mem,
-                        ),
-                        ..Default::default()
-                    };
+                    let options = sorting_parquet_writer::writers::SortingWriterOptions::builder()
+                        .with_flush_after_rows(max_mem)
+                        .build();
                     let mut writer = SortingParquetWriter::try_new_with_options(
                         file,
                         create_schema(),
@@ -194,12 +196,9 @@ fn bench_sorting_writer_mem_limit(c: &mut Criterion) {
                     let props = WriterProperties::builder()
                         .set_sorting_columns(Some(sorting_columns()))
                         .build();
-                    let options = sorting_parquet_writer::writers::SortingWriterOptions {
-                        flush_threshold: sorting_parquet_writer::writers::FlushThreshold::Bytes(
-                            max_mem,
-                        ),
-                        ..Default::default()
-                    };
+                    let options = sorting_parquet_writer::writers::SortingWriterOptions::builder()
+                        .with_flush_after_bytes(max_mem)
+                        .build();
                     let mut writer = SortingParquetWriter::try_new_with_options(
                         file,
                         create_schema(),
@@ -223,12 +222,16 @@ fn bench_sorting_writer_mem_limit(c: &mut Criterion) {
 fn bench_merge_phase(c: &mut Criterion) {
     let mut group = c.benchmark_group("merge_phase");
 
+    // The last two cases hold total rows constant at 320k and vary only the
+    // fan-in (64 vs 8). That gap is what compaction buys back.
     for &(num_runs, rows_per_run) in &[
         (2, 50_000),
         (5, 50_000),
         (10, 50_000),
         (20, 10_000),
         (20, 50_000),
+        (64, 5_000),
+        (8, 40_000),
     ] {
         let total_rows = num_runs * rows_per_run;
         let (runs, _temp_dir) = create_sorted_run_files(num_runs, rows_per_run);
@@ -252,6 +255,61 @@ fn bench_merge_phase(c: &mut Criterion) {
                         black_box(batch.unwrap());
                     }
                 })
+            },
+        );
+    }
+    group.finish();
+}
+
+// ── Compaction ──────────────────────────────────────────────────────────────
+
+/// A writer that has already spilled `num_runs` runs. Tickers are drawn from a
+/// small fixed set, so every run spans essentially the whole key range and the
+/// runs maximally overlap — the case compaction targets.
+fn writer_with_spilled_runs(
+    num_runs: usize,
+    rows_per_run: usize,
+) -> (SortingParquetWriter<std::fs::File>, tempfile::NamedTempFile) {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let file = temp.reopen().unwrap();
+    let props = WriterProperties::builder()
+        .set_sorting_columns(Some(sorting_columns()))
+        .build();
+    let options = SortingWriterOptions::builder()
+        .with_flush_after_rows(rows_per_run)
+        .build();
+    let mut writer =
+        SortingParquetWriter::try_new_with_options(file, create_schema(), props, options).unwrap();
+    for _ in 0..num_runs {
+        writer.write(&generate_batch(rows_per_run)).unwrap();
+    }
+    assert_eq!(writer.num_run_files(), num_runs);
+    (writer, temp)
+}
+
+fn bench_compaction(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compaction");
+
+    let rows_per_run = 10_000;
+    for &num_runs in &[4usize, 8, 16] {
+        group.throughput(Throughput::Elements((num_runs * rows_per_run) as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(num_runs),
+            &num_runs,
+            |b, &num_runs| {
+                b.iter_batched(
+                    || writer_with_spilled_runs(num_runs, rows_per_run),
+                    |(mut writer, _temp)| {
+                        // Collapse every run into one.
+                        let policy = CompactionPolicy {
+                            target_fan_in: 1,
+                            max_merge_inputs: num_runs,
+                            ..Default::default()
+                        };
+                        black_box(writer.compact(&policy).unwrap());
+                    },
+                    criterion::BatchSize::LargeInput,
+                )
             },
         );
     }
@@ -295,6 +353,7 @@ criterion_group!(
     bench_sorting_writer_mem_limit,
     bench_sorting_writer,
     bench_merge_phase,
+    bench_compaction,
     bench_sorted_groups_writer
 );
 criterion_main!(benches);

@@ -356,10 +356,9 @@ mod tests {
             file,
             schema,
             props,
-            SortingWriterOptions {
-                merge_sort_batches: true,
-                ..Default::default()
-            },
+            SortingWriterOptions::builder()
+                .with_merge_sort_batches(true)
+                .build(),
         )?;
         let mut duration_sum_sorted = Duration::ZERO;
 

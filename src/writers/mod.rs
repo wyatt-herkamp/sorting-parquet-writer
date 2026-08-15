@@ -12,7 +12,14 @@
 //! exposed via [`FinishProgressHandler`] / [`FinishProgress`] /
 //! [`FinishPhase`]; see
 //! [`SortingParquetWriter::finish_with_progress`].
+//!
+//! Long-running writers can bound the cost of that final merge by compacting
+//! their spilled runs as they go — see the [`compaction`] module for the
+//! policy, the `Send + 'static` [`CompactionJob`], and the reasoning behind
+//! which runs are worth merging.
 
+pub mod compaction;
+pub use compaction::*;
 mod progress;
 pub use progress::*;
 mod sorted_groups_writer;
