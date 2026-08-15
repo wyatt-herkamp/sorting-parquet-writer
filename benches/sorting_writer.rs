@@ -244,7 +244,7 @@ fn bench_merge_phase(c: &mut Criterion) {
                     let merger = SortedRunMerger::try_new(
                         black_box(runs.clone()),
                         cols.clone(),
-                        row_converter,
+                        row_converter.into(),
                         100_000,
                     )
                     .unwrap();

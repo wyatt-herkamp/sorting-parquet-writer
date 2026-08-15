@@ -31,6 +31,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::metadata::SortingColumn;
 
 use crate::SortingParquetError;
+use crate::utils::ArcCow;
 
 /// A handle to one sorted Parquet run file produced by the writer's spill phase.
 ///
@@ -169,7 +170,7 @@ pub struct SortedRunMerger {
     sorting_columns: Vec<SortingColumn>,
     output_batch_size: usize,
     read_batch_size: usize,
-    row_converter: RowConverter,
+    row_converter: ArcCow<RowConverter>,
     heap: BinaryHeap<MergeEntry>,
     next_cursor_idx: usize,
 }
@@ -190,7 +191,7 @@ impl SortedRunMerger {
     pub fn try_new(
         mut run_files: Vec<RunInfo>,
         sorting_columns: Vec<SortingColumn>,
-        row_converter: RowConverter,
+        row_converter: ArcCow<RowConverter>,
         output_batch_size: usize,
     ) -> Result<Self, SortingParquetError> {
         let num_runs = run_files.len();

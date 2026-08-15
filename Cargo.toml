@@ -15,7 +15,9 @@ arrow-schema = "58"
 arrow-row = "58"
 parquet = { version = "58", features = ["arrow"], default-features = false }
 thiserror = "2"
-
+tokio = { version = "1", features = ["rt"] }
+parking_lot = "0.12"
+tracing = "0.1"
 tempfile = "3"
 [features]
 tests = []
