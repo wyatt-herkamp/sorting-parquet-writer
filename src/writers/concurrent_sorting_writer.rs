@@ -498,9 +498,9 @@ impl<W: Write + Send> ConcurrentSortingParquetWriter<W> {
         match res {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(e),
-            Err(join_err) => Err(SortingParquetError::IoError(std::io::Error::other(format!(
-                "Background spill task panicked: {join_err}"
-            )))),
+            Err(join_err) => Err(SortingParquetError::IoError(std::io::Error::other(
+                format!("Background spill task panicked: {join_err}"),
+            ))),
         }
     }
     // ── Internal ────────────────────────────────────────────────────────
@@ -1203,7 +1203,10 @@ mod tests {
             .await
             .unwrap();
         writer
-            .write(&create_test_batch(vec![8, 0, 6, 4], vec!["h", "z", "f", "d"]))
+            .write(&create_test_batch(
+                vec![8, 0, 6, 4],
+                vec!["h", "z", "f", "d"],
+            ))
             .await
             .unwrap();
         writer.finish().await.unwrap();
