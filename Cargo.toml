@@ -1,6 +1,6 @@
 [package]
 name = "sorting-parquet-writer"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 description = "A Rust library for writing sorted Parquet files using Apache Arrow."
 license = "Apache-2.0 OR MIT"
@@ -10,10 +10,10 @@ documentation = "https://docs.rs/sorting-parquet-writer"
 readme = "README.md"
 
 [dependencies]
-arrow = { version = "58", default-features = false }
-arrow-schema = "58"
-arrow-row = "58"
-parquet = { version = "58", features = ["arrow"], default-features = false }
+arrow = { version = "59", default-features = false }
+arrow-schema = "59"
+arrow-row = "59"
+parquet = { version = "59", features = ["arrow"], default-features = false }
 thiserror = "2"
 
 tempfile = "3"
@@ -25,12 +25,12 @@ chrono = "0.4"
 anyhow = "1"
 tempfile = "3"
 rand = "0.10"
-arrow = { version = "58", features = ["prettyprint", "chrono-tz"] }
+arrow = { version = "59", features = ["prettyprint", "chrono-tz"] }
 humantime = "2"
 criterion = "0.8"
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.18"
-datafusion = "53"
+datafusion = "55"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [[bench]]
