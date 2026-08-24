@@ -41,7 +41,12 @@ use crate::SortingParquetError;
 ///
 /// The keys are wrapped in [`Arc`] so the merger can sort by them without
 /// cloning the underlying byte vectors.
-#[derive(Clone)]
+///
+/// `num_rows` and `file_size` are recorded when the run is written so that
+/// callers never need to reopen a footer to size a run. Compaction policies
+/// use them to prefer rewriting the least data
+/// (see [`CompactionPolicy`](crate::writers::CompactionPolicy)).
+#[derive(Clone, Debug)]
 pub struct RunInfo {
     /// Filesystem path of the sorted Parquet run file.
     pub path: PathBuf,
@@ -49,6 +54,10 @@ pub struct RunInfo {
     pub min_sort_key: Arc<Vec<u8>>,
     /// Encoded sort key of the last row in the run.
     pub max_sort_key: Arc<Vec<u8>>,
+    /// Number of rows stored in the run file.
+    pub num_rows: u64,
+    /// Size of the run file on disk, in bytes.
+    pub file_size: u64,
 }
 
 /// A cursor into one sorted run file during merge.

@@ -1,11 +1,11 @@
 use std::fs::File;
 use std::io::Write;
 use std::mem;
-use std::path::PathBuf;
 use std::sync::Arc;
-
+mod options;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+pub use options::*;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -14,6 +14,10 @@ use tempfile::TempDir;
 use crate::SortingParquetError;
 use crate::record_batch::streaming_merge::{RunInfo, SortedRunMerger};
 use crate::sorting::SortExtremes;
+use crate::writers::compaction::{
+    CompactionFailure, CompactionJob, CompactionOutput, CompactionPolicy, CompactionStats,
+    peak_fan_in, select_overlap_cluster,
+};
 use crate::writers::progress::{
     FinishPhase, FinishProgress, FinishProgressHandler, NoopProgressHandler,
 };
@@ -67,91 +71,6 @@ impl FlushThreshold {
     }
 }
 
-/// Configuration options for the sorting writer's external merge sort behavior.
-///
-/// These options control how data is buffered, sorted, and spilled to disk
-/// during the write phase. They are separate from [`WriterProperties`], which
-/// controls Parquet encoding and compression for the final output file.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use sorting_parquet_writer::writers::{SortingWriterOptions, FlushThreshold};
-/// use std::path::PathBuf;
-///
-/// let options = SortingWriterOptions {
-///     flush_threshold: FlushThreshold::Either {
-///         max_rows: 500_000,
-///         max_bytes: 256 * 1024 * 1024,
-///     },
-///     temp_dir: Some(PathBuf::from("/fast-ssd/tmp")),
-///     ..Default::default()
-/// };
-/// ```
-#[derive(Debug, Clone)]
-pub struct SortingWriterOptions {
-    /// Controls when buffered data is flushed to a sorted run file.
-    ///
-    /// Default: `FlushThreshold::Rows(1_000_000)`
-    pub flush_threshold: FlushThreshold,
-
-    /// Directory for temporary sorted run files. If `None`, the system's
-    /// default temp directory is used.
-    ///
-    /// Run files are automatically cleaned up when the writer is finished or dropped.
-    ///
-    /// Default: `None` (system temp directory)
-    pub temp_dir: Option<PathBuf>,
-
-    /// Writer properties for temporary run files. Controls compression and
-    /// encoding of intermediate sorted data on disk.
-    ///
-    /// By default, run files disable statistics for faster writes since they
-    /// are only read during the merge phase and immediately deleted.
-    ///
-    /// Tip: Use fast compression (e.g., LZ4) for run files even if the final
-    /// output uses stronger compression like ZSTD.
-    ///
-    /// Default: statistics disabled, default compression
-    pub run_file_properties: Option<WriterProperties>,
-
-    /// When `true`, each incoming [`RecordBatch`] is sorted individually on
-    /// [`write()`](SortingParquetWriter::write) and the flush phase merges the
-    /// pre-sorted batches with a streaming k-way merge instead of concatenating
-    /// and re-sorting them from scratch.
-    ///
-    /// This trades a per-batch sort cost on the write path for a cheaper
-    /// flush:
-    ///
-    /// - With `merge_sort_batches = false` (default), `flush_to_run`
-    ///   concatenates every buffered batch and runs one *O(n log n)* sort
-    ///   over the result. Peak memory transiently holds both the
-    ///   concatenated input and the sorted output.
-    /// - With `merge_sort_batches = true`, each `write()` does an *O(b log b)*
-    ///   sort on its own batch (size `b`) and the flush is an *O(n)* k-way
-    ///   merge that streams across the already-sorted batches. The
-    ///   concatenation copy is avoided.
-    ///
-    /// Enable this when batches arrive unsorted and the flush buffer holds
-    /// many batches; the per-batch sort amortizes well against a much
-    /// cheaper flush. If batches are already sorted at the source, only the
-    /// merge benefit applies.
-    ///
-    /// Default: `false`
-    pub merge_sort_batches: bool,
-}
-
-impl Default for SortingWriterOptions {
-    fn default() -> Self {
-        Self {
-            flush_threshold: FlushThreshold::Rows(DEFAULT_MAX_MEMORY_ROWS),
-            temp_dir: None,
-            run_file_properties: None,
-            merge_sort_batches: false,
-        }
-    }
-}
-
 /// A Parquet writer that produces a globally sorted output file.
 ///
 /// Uses an external merge sort strategy:
@@ -196,9 +115,15 @@ pub struct SortingParquetWriter<W: Write + Send> {
     buffered_rows: usize,
     buffered_bytes: usize,
     options: SortingWriterOptions,
-    temp_dir: TempDir,
+    /// `Arc` so an in-flight [`CompactionJob`] can hold the directory alive:
+    /// dropping the writer mid-job must not unlink the job's output path.
+    temp_dir: Arc<TempDir>,
     run_files: Vec<RunInfo>,
     run_count: usize,
+    /// Compaction jobs handed out but not yet applied or abandoned. Their runs
+    /// are absent from `run_files`, so finishing with any outstanding is an
+    /// error rather than silent data loss.
+    runs_in_flight: usize,
 }
 
 impl<W: Write + Send> SortingParquetWriter<W> {
@@ -258,9 +183,10 @@ impl<W: Write + Send> SortingParquetWriter<W> {
             buffered_rows: 0,
             buffered_bytes: 0,
             options,
-            temp_dir,
+            temp_dir: Arc::new(temp_dir),
             run_files: Vec::new(),
             run_count: 0,
+            runs_in_flight: 0,
         })
     }
 
@@ -364,6 +290,12 @@ impl<W: Write + Send> SortingParquetWriter<W> {
         mut self,
         mut handler: impl FinishProgressHandler,
     ) -> Result<W, SortingParquetError> {
+        // Runs held by an outstanding compaction job aren't in `run_files`;
+        // merging without them would silently drop rows.
+        if self.runs_in_flight > 0 {
+            return Err(SortingParquetError::CompactionInFlight(self.runs_in_flight));
+        }
+
         let sorting_columns = self
             .properties
             .sorting_columns()
@@ -386,10 +318,11 @@ impl<W: Write + Send> SortingParquetWriter<W> {
             }
             1 => {
                 // Single run — already fully sorted, just copy through
+                let total_rows = self.run_files[0].num_rows;
                 let file = File::open(&self.run_files[0].path)?;
-                let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-                let total_rows = builder.metadata().file_metadata().num_rows() as u64;
-                let reader = builder.with_batch_size(output_batch_size).build()?;
+                let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+                    .with_batch_size(output_batch_size)
+                    .build()?;
 
                 let mut progress = FinishProgress {
                     phase: FinishPhase::CopyThrough,
@@ -409,8 +342,7 @@ impl<W: Write + Send> SortingParquetWriter<W> {
                 }
             }
             _ => {
-                // Read total row count from all run file metadata
-                let total_rows = self.read_total_rows()?;
+                let total_rows = self.total_run_rows();
 
                 let mut progress = FinishProgress {
                     phase: FinishPhase::Merging,
@@ -478,6 +410,170 @@ impl<W: Write + Send> SortingParquetWriter<W> {
         self.target.bytes_written()
     }
 
+    /// Returns the sorted run files flushed so far, with their key ranges and
+    /// sizes.
+    ///
+    /// Runs currently held by an outstanding [`CompactionJob`] are not
+    /// included.
+    pub fn run_files(&self) -> &[RunInfo] {
+        &self.run_files
+    }
+
+    /// Returns the largest number of run files the final merge would need to
+    /// hold open simultaneously.
+    ///
+    /// This — not [`num_run_files()`](Self::num_run_files) — is the number
+    /// that determines whether [`finish()`](Self::finish) is expensive.
+    /// [`SortedRunMerger`] opens a run only once the merge position reaches
+    /// its `min_sort_key`, so runs with disjoint key ranges give `1` no matter
+    /// how many there are, while fully overlapping runs give the full count.
+    ///
+    /// Use it to decide when to compact:
+    ///
+    /// ```rust,no_run
+    /// # use sorting_parquet_writer::writers::{SortingParquetWriter, CompactionPolicy};
+    /// # fn example(writer: &mut SortingParquetWriter<std::fs::File>) -> Result<(), Box<dyn std::error::Error>> {
+    /// if writer.peak_merge_fan_in() > 128 {
+    ///     writer.compact(&CompactionPolicy::default())?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn peak_merge_fan_in(&self) -> usize {
+        peak_fan_in(&self.run_files)
+    }
+
+    /// Returns the number of compaction jobs handed out by
+    /// [`take_compaction_job`](Self::take_compaction_job) that have not yet
+    /// been applied or abandoned.
+    ///
+    /// [`finish()`](Self::finish) fails while this is non-zero.
+    pub fn compactions_in_flight(&self) -> usize {
+        self.runs_in_flight
+    }
+
+    // ── Compaction ──────────────────────────────────────────────────────
+
+    /// Compacts overlapping run files in place, merging them into fewer,
+    /// larger runs to bound the cost of the final merge.
+    ///
+    /// Returns `Ok(None)` when `policy` selects nothing — most importantly
+    /// when peak fan-in is already within
+    /// [`CompactionPolicy::target_fan_in`], which is always the case for runs
+    /// with disjoint key ranges.
+    ///
+    /// This blocks the calling thread for the duration of the merge. To
+    /// overlap compaction with writing, use
+    /// [`take_compaction_job`](Self::take_compaction_job) instead — it is the
+    /// same work, handed to you as a `Send + 'static` value.
+    ///
+    /// On failure the selected runs are returned to the writer, so a failed
+    /// compaction never loses data.
+    pub fn compact(
+        &mut self,
+        policy: &CompactionPolicy,
+    ) -> Result<Option<CompactionStats>, SortingParquetError> {
+        let Some(job) = self.take_compaction_job(policy) else {
+            return Ok(None);
+        };
+        match job.run() {
+            Ok(output) => {
+                let stats = output.stats;
+                self.apply_compaction(output)?;
+                Ok(Some(stats))
+            }
+            Err(failure) => Err(self.abandon_compaction(failure)),
+        }
+    }
+
+    /// Selects runs to compact and detaches them from the writer, returning a
+    /// self-contained job.
+    ///
+    /// Returns `None` when the policy selects nothing to do.
+    ///
+    /// The returned [`CompactionJob`] is `Send + 'static` — run it on another
+    /// thread, a pool, or `tokio::task::spawn_blocking`, then give it back
+    /// with [`apply_compaction`](Self::apply_compaction) or
+    /// [`abandon_compaction`](Self::abandon_compaction). The writer keeps
+    /// accepting [`write()`](Self::write) calls in the meantime, but
+    /// [`finish()`](Self::finish) fails until every job is returned.
+    ///
+    /// See the [`compaction`](crate::writers::compaction) module docs for a
+    /// full example.
+    pub fn take_compaction_job(&mut self, policy: &CompactionPolicy) -> Option<CompactionJob> {
+        let sorting_columns = self.properties.sorting_columns()?.clone();
+        let selected = select_overlap_cluster(&self.run_files, policy)?;
+
+        // Remove back-to-front so the earlier indices stay valid.
+        let mut inputs = Vec::with_capacity(selected.len());
+        for &idx in selected.iter().rev() {
+            inputs.push(self.run_files.remove(idx));
+        }
+        inputs.reverse();
+
+        // `run_count` is monotonic, so this never collides with a removed run.
+        let output_path = self
+            .temp_dir
+            .path()
+            .join(format!("run_{}.parquet", self.run_count));
+        self.run_count += 1;
+        self.runs_in_flight += 1;
+
+        Some(CompactionJob::new(
+            inputs,
+            output_path,
+            self.schema.clone(),
+            sorting_columns,
+            self.run_file_properties(),
+            policy.output_batch_size,
+            self.temp_dir.clone(),
+        ))
+    }
+
+    /// Adopts a completed compaction: the merged run joins the writer's run
+    /// list and the runs it replaced are deleted from disk.
+    ///
+    /// Failures to unlink a replaced file are ignored — the run is already
+    /// unreferenced, and the writer's temp directory removes it on drop
+    /// regardless. Failing here would strand the freshly merged run instead.
+    pub fn apply_compaction(
+        &mut self,
+        output: CompactionOutput,
+    ) -> Result<(), SortingParquetError> {
+        self.run_files.push(output.run);
+        self.runs_in_flight = self.runs_in_flight.saturating_sub(1);
+        for replaced in output.replaced {
+            let _ = std::fs::remove_file(&replaced.path);
+        }
+        Ok(())
+    }
+
+    /// Returns the runs from a failed compaction to the writer, and hands back
+    /// the error that caused it.
+    ///
+    /// The input files are untouched, so the writer is left exactly as it was
+    /// before [`take_compaction_job`](Self::take_compaction_job) — only the
+    /// wasted merge work is lost. The job has already cleaned up its partial
+    /// output.
+    ///
+    /// The returned error is yours to propagate or log; discarding it is fine
+    /// and simply retries the work later.
+    pub fn abandon_compaction(&mut self, failure: CompactionFailure) -> SortingParquetError {
+        self.run_files.extend(failure.inputs);
+        self.runs_in_flight = self.runs_in_flight.saturating_sub(1);
+        failure.error
+    }
+
+    /// The properties used when writing run files, matching `flush_to_run`.
+    fn run_file_properties(&self) -> WriterProperties {
+        self.options.run_file_properties.clone().unwrap_or_else(|| {
+            WriterProperties::builder()
+                .set_write_page_header_statistics(false)
+                .set_statistics_enabled(EnabledStatistics::None)
+                .build()
+        })
+    }
+
     // ── Access ──────────────────────────────────────────────────────────
 
     /// Returns a reference to the Arrow schema used by this writer.
@@ -491,6 +587,10 @@ impl<W: Write + Send> SortingParquetWriter<W> {
     }
 
     /// Returns a reference to the sorting writer options.
+    ///
+    /// Individual settings are read through the getters on
+    /// [`SortingWriterOptions`], e.g.
+    /// [`flush_threshold()`](SortingWriterOptions::flush_threshold).
     pub fn sorting_options(&self) -> &SortingWriterOptions {
         &self.options
     }
@@ -507,21 +607,16 @@ impl<W: Write + Send> SortingParquetWriter<W> {
 
     // ── Internal ────────────────────────────────────────────────────────
 
-    /// Sum the row counts from all run-file Parquet metadata.
+    /// Sum the row counts of all run files.
     ///
-    /// Called once before the multi-run merge so the [`FinishProgress`]
-    /// reported via [`finish_with_progress`](Self::finish_with_progress) has
-    /// a fixed denominator (`total_rows`). Reads only the footers, not the
-    /// row data.
-    fn read_total_rows(&self) -> Result<u64, SortingParquetError> {
-        let mut total = 0u64;
-        for run in &self.run_files {
-            let file = File::open(&run.path)?;
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-            total += builder.metadata().file_metadata().num_rows() as u64;
-        }
-        Ok(total)
+    /// Used as the fixed denominator (`total_rows`) for the [`FinishProgress`]
+    /// reported via [`finish_with_progress`](Self::finish_with_progress).
+    /// Reads the counts recorded on each [`RunInfo`] at flush time, so no
+    /// footers are reopened.
+    fn total_run_rows(&self) -> u64 {
+        self.run_files.iter().map(|run| run.num_rows).sum()
     }
+
     fn flush_to_run_merge_sort(
         &mut self,
     ) -> Result<(RecordBatch, SortExtremes), SortingParquetError> {
@@ -606,14 +701,28 @@ impl<W: Write + Send> SortingParquetWriter<W> {
         let mut run_writer =
             ArrowWriter::try_new(run_file, self.schema.clone(), Some(run_file_props))?;
 
+        let num_rows = sorted.num_rows() as u64;
         run_writer.write(&sorted)?;
         run_writer.close()?;
+        let file_size = std::fs::metadata(&run_path)?.len();
 
         self.run_files.push(RunInfo {
             path: run_path,
             min_sort_key: Arc::new(min_sort_key),
             max_sort_key: Arc::new(max_sort_key),
+            num_rows,
+            file_size,
         });
+
+        // Opt-in safety valve: keep the final merge's fan-in bounded so a
+        // long-running writer can't accumulate enough overlapping runs to
+        // exhaust file descriptors or memory at `finish()` time.
+        if let Some(target_fan_in) = self.options.auto_compact_at {
+            self.compact(&CompactionPolicy {
+                target_fan_in,
+                ..CompactionPolicy::default()
+            })?;
+        }
         Ok(())
     }
 }
@@ -731,10 +840,9 @@ mod tests {
 
         let temp = tempfile::NamedTempFile::new().unwrap();
         let file = temp.reopen().unwrap();
-        let options = SortingWriterOptions {
-            flush_threshold: FlushThreshold::Rows(3),
-            ..Default::default()
-        };
+        let options = SortingWriterOptions::builder()
+            .with_flush_after_rows(3)
+            .build();
         let mut writer =
             SortingParquetWriter::try_new_with_options(file, schema.clone(), properties, options)
                 .unwrap();
@@ -800,10 +908,9 @@ mod tests {
 
         let temp = tempfile::NamedTempFile::new().unwrap();
         let file = temp.reopen().unwrap();
-        let options = SortingWriterOptions {
-            flush_threshold: FlushThreshold::Rows(100),
-            ..Default::default()
-        };
+        let options = SortingWriterOptions::builder()
+            .with_flush_after_rows(100)
+            .build();
         let mut writer =
             SortingParquetWriter::try_new_with_options(file, schema.clone(), properties, options)
                 .unwrap();
@@ -845,10 +952,9 @@ mod tests {
             .set_sorting_columns(Some(TickerItem::sorting_columns()))
             .build();
         let schema = TickerItem::schema();
-        let options = SortingWriterOptions {
-            flush_threshold: FlushThreshold::Rows(100_000),
-            ..Default::default()
-        };
+        let options = SortingWriterOptions::builder()
+            .with_flush_after_rows(100_000)
+            .build();
         let mut writer =
             SortingParquetWriter::try_new_with_options(file, schema.clone(), props, options)
                 .unwrap();
@@ -896,10 +1002,9 @@ mod tests {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let file = temp.reopen().unwrap();
         // Use a very small byte threshold to force spills
-        let options = SortingWriterOptions {
-            flush_threshold: FlushThreshold::Bytes(1),
-            ..Default::default()
-        };
+        let options = SortingWriterOptions::builder()
+            .with_flush_after_bytes(1)
+            .build();
         let mut writer =
             SortingParquetWriter::try_new_with_options(file, schema.clone(), properties, options)
                 .unwrap();
@@ -955,13 +1060,9 @@ mod tests {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let file = temp.reopen().unwrap();
         // Row limit is very high, but byte limit is tiny — bytes should trigger
-        let options = SortingWriterOptions {
-            flush_threshold: FlushThreshold::Either {
-                max_rows: usize::MAX,
-                max_bytes: 1,
-            },
-            ..Default::default()
-        };
+        let options = SortingWriterOptions::builder()
+            .with_flush_after_rows_or_bytes(usize::MAX, 1)
+            .build();
         let mut writer =
             SortingParquetWriter::try_new_with_options(file, schema.clone(), properties, options)
                 .unwrap();
@@ -1051,5 +1152,385 @@ mod tests {
             }
         }
         assert_eq!(all_ids, vec![0, 1, 2, 3]);
+    }
+
+    // ── Compaction ──────────────────────────────────────────────────────
+
+    fn sorting_props() -> WriterProperties {
+        WriterProperties::builder()
+            .set_sorting_columns(Some(vec![SortingColumn {
+                column_idx: 0,
+                descending: false,
+                nulls_first: false,
+            }]))
+            .build()
+    }
+
+    /// A writer that spills every `rows_per_run` rows into a run covering the
+    /// whole key range, so the runs maximally overlap — the case compaction
+    /// exists for.
+    fn writer_with_overlapping_runs(
+        file: std::fs::File,
+        num_runs: usize,
+        rows_per_run: usize,
+        options: SortingWriterOptions,
+    ) -> (SortingParquetWriter<std::fs::File>, Vec<i32>) {
+        let schema = create_test_schema();
+        let mut writer =
+            SortingParquetWriter::try_new_with_options(file, schema, sorting_props(), options)
+                .unwrap();
+
+        let mut expected = Vec::new();
+        for run in 0..num_runs {
+            // Stride through the key space so every run spans it end to end.
+            let ids: Vec<i32> = (0..rows_per_run)
+                .map(|i| (i * num_runs + run) as i32)
+                .collect();
+            let names: Vec<String> = ids.iter().map(|id| format!("n{id}")).collect();
+            let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+            expected.extend_from_slice(&ids);
+            writer
+                .write(&create_test_batch(ids.clone(), name_refs))
+                .unwrap();
+        }
+        expected.sort_unstable();
+        (writer, expected)
+    }
+
+    fn read_ids(temp: &tempfile::NamedTempFile) -> Vec<i32> {
+        let file = temp.reopen().unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut ids = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                ids.push(col.value(i));
+            }
+        }
+        ids
+    }
+
+    fn overlapping_options(rows_per_run: usize) -> SortingWriterOptions {
+        SortingWriterOptions::builder()
+            .with_flush_after_rows(rows_per_run)
+            .build()
+    }
+
+    #[test]
+    fn test_compaction_reduces_fan_in_and_preserves_order() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let (mut writer, expected) =
+            writer_with_overlapping_runs(temp.reopen().unwrap(), 12, 50, overlapping_options(50));
+
+        assert_eq!(writer.num_run_files(), 12);
+        assert_eq!(writer.peak_merge_fan_in(), 12);
+
+        let policy = CompactionPolicy {
+            target_fan_in: 4,
+            max_merge_inputs: 5,
+            ..Default::default()
+        };
+        let stats = writer.compact(&policy).unwrap().expect("should compact");
+        assert_eq!(stats.input_runs, 5);
+        assert_eq!(stats.rows, 5 * 50);
+        assert!(stats.bytes_written > 0);
+
+        // Five runs became one.
+        assert_eq!(writer.num_run_files(), 8);
+        assert_eq!(writer.peak_merge_fan_in(), 8);
+
+        writer.finish().unwrap();
+        assert_eq!(read_ids(&temp), expected);
+    }
+
+    #[test]
+    fn test_compaction_loop_reaches_target_fan_in() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let (mut writer, expected) =
+            writer_with_overlapping_runs(temp.reopen().unwrap(), 16, 40, overlapping_options(40));
+
+        let policy = CompactionPolicy {
+            target_fan_in: 4,
+            max_merge_inputs: 4,
+            ..Default::default()
+        };
+        while writer.compact(&policy).unwrap().is_some() {}
+
+        assert!(
+            writer.peak_merge_fan_in() <= 4,
+            "fan-in {} should be within target",
+            writer.peak_merge_fan_in()
+        );
+
+        writer.finish().unwrap();
+        assert_eq!(read_ids(&temp), expected);
+    }
+
+    #[test]
+    fn test_compaction_output_matches_uncompacted_output() {
+        // The whole feature must be observationally invisible in the output.
+        let plain = tempfile::NamedTempFile::new().unwrap();
+        let (writer, expected) =
+            writer_with_overlapping_runs(plain.reopen().unwrap(), 10, 60, overlapping_options(60));
+        writer.finish().unwrap();
+
+        let compacted = tempfile::NamedTempFile::new().unwrap();
+        let (mut writer, _) = writer_with_overlapping_runs(
+            compacted.reopen().unwrap(),
+            10,
+            60,
+            overlapping_options(60),
+        );
+        let policy = CompactionPolicy {
+            target_fan_in: 2,
+            max_merge_inputs: 4,
+            ..Default::default()
+        };
+        while writer.compact(&policy).unwrap().is_some() {}
+        writer.finish().unwrap();
+
+        assert_eq!(read_ids(&plain), expected);
+        assert_eq!(read_ids(&compacted), expected);
+    }
+
+    #[test]
+    fn test_compaction_down_to_single_run_uses_copy_through() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let (mut writer, expected) =
+            writer_with_overlapping_runs(temp.reopen().unwrap(), 6, 30, overlapping_options(30));
+
+        let policy = CompactionPolicy {
+            target_fan_in: 1,
+            max_merge_inputs: 16,
+            ..Default::default()
+        };
+        writer.compact(&policy).unwrap().expect("should compact");
+        assert_eq!(writer.num_run_files(), 1);
+
+        // finish() now takes the CopyThrough branch.
+        writer.finish().unwrap();
+        assert_eq!(read_ids(&temp), expected);
+    }
+
+    #[test]
+    fn test_compaction_deletes_replaced_run_files() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let (mut writer, _) =
+            writer_with_overlapping_runs(temp.reopen().unwrap(), 6, 30, overlapping_options(30));
+
+        let policy = CompactionPolicy {
+            target_fan_in: 2,
+            max_merge_inputs: 4,
+            ..Default::default()
+        };
+        let job = writer.take_compaction_job(&policy).expect("should select");
+        let replaced: Vec<_> = job.input_runs().iter().map(|r| r.path.clone()).collect();
+        assert_eq!(replaced.len(), 4);
+        assert!(replaced.iter().all(|p| p.exists()));
+
+        let output = job.run().unwrap();
+        let new_path = output.run.path.clone();
+        writer.apply_compaction(output).unwrap();
+
+        assert!(
+            replaced.iter().all(|p| !p.exists()),
+            "replaced run files should be unlinked"
+        );
+        assert!(new_path.exists());
+    }
+
+    #[test]
+    fn test_compaction_noop_cases() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let schema = create_test_schema();
+        let mut writer =
+            SortingParquetWriter::try_new(temp.reopen().unwrap(), schema, sorting_props()).unwrap();
+        let policy = CompactionPolicy::default();
+
+        // No runs at all.
+        assert!(writer.compact(&policy).unwrap().is_none());
+        assert_eq!(writer.peak_merge_fan_in(), 0);
+
+        // A single run is never worth compacting.
+        writer
+            .write(&create_test_batch(vec![3, 1], vec!["c", "a"]))
+            .unwrap();
+        writer.flush_buffer().unwrap();
+        assert_eq!(writer.num_run_files(), 1);
+        assert!(writer.compact(&policy).unwrap().is_none());
+        assert_eq!(writer.num_run_files(), 1);
+    }
+
+    #[test]
+    fn test_compaction_skips_disjoint_runs() {
+        // Runs written in ascending order don't overlap, so the merger already
+        // handles them one file at a time and compaction must decline.
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let schema = create_test_schema();
+        let mut writer = SortingParquetWriter::try_new_with_options(
+            temp.reopen().unwrap(),
+            schema,
+            sorting_props(),
+            overlapping_options(20),
+        )
+        .unwrap();
+
+        for run in 0..10i32 {
+            let ids: Vec<i32> = (0..20).map(|i| run * 20 + i).collect();
+            let names: Vec<String> = ids.iter().map(|id| format!("n{id}")).collect();
+            let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+            writer.write(&create_test_batch(ids, name_refs)).unwrap();
+        }
+
+        assert_eq!(writer.num_run_files(), 10);
+        assert_eq!(writer.peak_merge_fan_in(), 1);
+
+        let policy = CompactionPolicy {
+            target_fan_in: 1,
+            ..Default::default()
+        };
+        assert!(writer.compact(&policy).unwrap().is_none());
+        assert_eq!(writer.num_run_files(), 10);
+    }
+
+    #[test]
+    fn test_compaction_job_runs_on_another_thread() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let (mut writer, expected) =
+            writer_with_overlapping_runs(temp.reopen().unwrap(), 10, 50, overlapping_options(50));
+
+        let policy = CompactionPolicy {
+            target_fan_in: 2,
+            max_merge_inputs: 6,
+            ..Default::default()
+        };
+        let job = writer.take_compaction_job(&policy).expect("should select");
+        assert_eq!(writer.compactions_in_flight(), 1);
+        assert_eq!(writer.num_run_files(), 4);
+        assert_eq!(job.estimated_rows(), 6 * 50);
+
+        // The job is Send + 'static, so this compiles and runs off-thread.
+        let output = std::thread::spawn(move || job.run())
+            .join()
+            .expect("compaction thread panicked")
+            .expect("compaction should succeed");
+
+        writer.apply_compaction(output).unwrap();
+        assert_eq!(writer.compactions_in_flight(), 0);
+        assert_eq!(writer.num_run_files(), 5);
+
+        writer.finish().unwrap();
+        assert_eq!(read_ids(&temp), expected);
+    }
+
+    #[test]
+    fn test_writes_continue_while_a_compaction_job_is_in_flight() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let (mut writer, mut expected) =
+            writer_with_overlapping_runs(temp.reopen().unwrap(), 8, 40, overlapping_options(40));
+
+        let policy = CompactionPolicy {
+            target_fan_in: 2,
+            max_merge_inputs: 4,
+            ..Default::default()
+        };
+        let job = writer.take_compaction_job(&policy).expect("should select");
+        let handle = std::thread::spawn(move || job.run());
+
+        // Keep writing against detached runs.
+        let extra: Vec<i32> = vec![-5, -3, -1];
+        let names: Vec<String> = extra.iter().map(|id| format!("n{id}")).collect();
+        let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        writer
+            .write(&create_test_batch(extra.clone(), name_refs))
+            .unwrap();
+        expected.extend_from_slice(&extra);
+        expected.sort_unstable();
+
+        let output = handle.join().unwrap().unwrap();
+        writer.apply_compaction(output).unwrap();
+        writer.finish().unwrap();
+
+        assert_eq!(read_ids(&temp), expected);
+    }
+
+    #[test]
+    fn test_finish_rejects_an_in_flight_compaction() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let (mut writer, _) =
+            writer_with_overlapping_runs(temp.reopen().unwrap(), 6, 30, overlapping_options(30));
+
+        let policy = CompactionPolicy {
+            target_fan_in: 2,
+            max_merge_inputs: 4,
+            ..Default::default()
+        };
+        let job = writer.take_compaction_job(&policy).expect("should select");
+
+        // Finishing now would silently drop the detached runs.
+        let err = writer.finish().unwrap_err();
+        assert!(
+            matches!(err, SortingParquetError::CompactionInFlight(1)),
+            "expected CompactionInFlight, got {err:?}"
+        );
+        drop(job);
+    }
+
+    #[test]
+    fn test_abandon_compaction_restores_runs() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let (mut writer, expected) =
+            writer_with_overlapping_runs(temp.reopen().unwrap(), 6, 30, overlapping_options(30));
+
+        let policy = CompactionPolicy {
+            target_fan_in: 2,
+            max_merge_inputs: 4,
+            ..Default::default()
+        };
+        let job = writer.take_compaction_job(&policy).expect("should select");
+        assert_eq!(writer.num_run_files(), 2);
+
+        let failure = CompactionFailure {
+            error: SortingParquetError::WriterClosed,
+            inputs: job.input_runs().to_vec(),
+        };
+        drop(job);
+        let err = writer.abandon_compaction(failure);
+        assert!(matches!(err, SortingParquetError::WriterClosed));
+
+        assert_eq!(writer.num_run_files(), 6);
+        assert_eq!(writer.compactions_in_flight(), 0);
+
+        // No rows lost.
+        writer.finish().unwrap();
+        assert_eq!(read_ids(&temp), expected);
+    }
+
+    #[test]
+    fn test_auto_compact_at_bounds_fan_in() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let options = SortingWriterOptions::builder()
+            .with_flush_after_rows(40)
+            .with_auto_compact_at(4)
+            .build();
+        let (writer, expected) =
+            writer_with_overlapping_runs(temp.reopen().unwrap(), 20, 40, options);
+
+        assert!(
+            writer.peak_merge_fan_in() <= 4,
+            "auto-compaction should have bounded fan-in, got {}",
+            writer.peak_merge_fan_in()
+        );
+
+        writer.finish().unwrap();
+        assert_eq!(read_ids(&temp), expected);
     }
 }

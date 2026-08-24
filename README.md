@@ -13,6 +13,7 @@ A Rust library for writing sorted Parquet files with bounded memory usage. Inspi
 - **Per-row-group sorting** for lighter-weight optimization (`SortedGroupsParquetWriter`)
 - **Bounded memory** — configurable row buffer with automatic spill to temporary run files
 - **Streaming k-way merge** — final merge reads one batch per run file at a time
+- **Run compaction** — merge overlapping run files as you go to bound the cost of the final merge; jobs are `Send + 'static` so they can run on another thread
 - **Progress tracking** — callback-based progress reporting during the merge phase
 - Supports int, uint, float, bool, string, and list column types
 
@@ -57,20 +58,28 @@ Produces a **globally sorted** Parquet file using external merge sort:
 1. **Write phase** — buffers incoming `RecordBatch`es in memory. When the configured `FlushThreshold` is reached (row count, byte size, or either), the buffer is sorted and flushed to a temporary run file on disk.
 2. **Merge phase** (`finish()`) — all sorted run files are merged via a streaming k-way merge into the final output.
 
-Configure via `SortingWriterOptions`:
+Configure via `SortingWriterOptions::builder()`:
 
 ```rust
-use sorting_parquet_writer::writers::{SortingWriterOptions, FlushThreshold};
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
+use sorting_parquet_writer::writers::SortingWriterOptions;
 
-let options = SortingWriterOptions {
-    flush_threshold: FlushThreshold::Rows(500_000),     // rows before spilling (default: 1M)
-    // Or use byte-based: FlushThreshold::Bytes(256 * 1024 * 1024)
-    // Or both: FlushThreshold::Either { max_rows: 500_000, max_bytes: 256 * 1024 * 1024 }
-    temp_dir: Some("/fast-ssd/tmp".into()),             // run file location
-    run_file_properties: None,                          // compression for run files
-    ..Default::default()
-};
+let options = SortingWriterOptions::builder()
+    .with_flush_after_rows(500_000)      // rows before spilling (default: 1M)
+    // Or byte-based:  .with_flush_after_bytes(256 * 1024 * 1024)
+    // Or both:        .with_flush_after_rows_or_bytes(500_000, 256 * 1024 * 1024)
+    .with_temp_dir("/fast-ssd/tmp")      // run file location
+    .with_run_file_properties(           // compression for run files
+        WriterProperties::builder()
+            .set_compression(Compression::LZ4_RAW)
+            .build(),
+    )
+    .build();
 ```
+
+The fields are private — the builder is the only way to set them, and
+`SortingWriterOptions` exposes a getter per setting for reading them back.
 
 #### Progress Tracking
 
@@ -88,6 +97,72 @@ writer.finish_with_progress(|p: &FinishProgress| {
     );
 }).unwrap();
 # }
+```
+
+#### Run Compaction
+
+Long-running writers accumulate run files. The merger opens a run only once the
+merge position reaches its minimum sort key, so runs with **disjoint** key ranges
+cost about one open file at a time no matter how many there are. **Overlapping**
+runs are the problem: they must all be open at once, each costing a file
+descriptor and a decoded batch. Enough of them and `finish()` runs out of file
+descriptors or memory.
+
+`peak_merge_fan_in()` reports the worst case — the most runs the final merge will
+ever hold open simultaneously. Compaction merges overlapping runs to bring it down:
+
+```rust
+use sorting_parquet_writer::writers::CompactionPolicy;
+
+# fn example(writer: &mut sorting_parquet_writer::writers::SortingParquetWriter<std::fs::File>)
+# -> Result<(), Box<dyn std::error::Error>> {
+// Blocking, in place. Returns Ok(None) when nothing is worth compacting —
+// which is always the case for runs with disjoint key ranges.
+writer.compact(&CompactionPolicy::default())?;
+# Ok(())
+# }
+```
+
+To overlap compaction with writing, take the job and run it elsewhere. It owns
+everything it needs and is `Send + 'static`, so this works on a plain thread, a
+pool, or `tokio::task::spawn_blocking` — the crate itself stays runtime-agnostic
+and depends on no async runtime:
+
+```rust
+use sorting_parquet_writer::writers::CompactionPolicy;
+
+# fn example(writer: &mut sorting_parquet_writer::writers::SortingParquetWriter<std::fs::File>)
+# -> Result<(), Box<dyn std::error::Error>> {
+if let Some(job) = writer.take_compaction_job(&CompactionPolicy::default()) {
+    let handle = std::thread::spawn(move || job.run());
+
+    // ... keep calling writer.write(&batch) here ...
+
+    match handle.join().expect("compaction thread panicked") {
+        Ok(output) => writer.apply_compaction(output)?,
+        Err(failure) => {
+            // Runs are handed back intact; nothing is lost.
+            let err = writer.abandon_compaction(failure);
+            eprintln!("compaction failed, will retry: {err}");
+        }
+    }
+}
+# Ok(())
+# }
+```
+
+`finish()` returns `SortingParquetError::CompactionInFlight` while any job is
+outstanding, since its runs are detached from the writer.
+
+For a hands-off safety valve, set `auto_compact_at` and the writer compacts
+inline whenever a flush pushes fan-in past the limit:
+
+```rust
+use sorting_parquet_writer::writers::SortingWriterOptions;
+
+let options = SortingWriterOptions::builder()
+    .with_auto_compact_at(256)  // default: no automatic compaction
+    .build();
 ```
 
 ### `SortedGroupsParquetWriter`

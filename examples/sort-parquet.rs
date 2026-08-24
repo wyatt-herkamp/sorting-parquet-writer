@@ -35,6 +35,11 @@ struct Cli {
     pub max_memory_bytes: Option<MemorySize>,
     #[arg(long, help = "Use merge sort for sorting batches", action = clap::ArgAction::SetTrue)]
     pub merge_sort: bool,
+    #[arg(
+        long,
+        help = "Compact run files whenever the peak merge fan-in exceeds this (default: off)"
+    )]
+    pub auto_compact_at: Option<usize>,
     /// Input file path. Must be a Parquet file.
     #[arg(help = "Path to the Parquet file to sort")]
     pub file: PathBuf,
@@ -161,11 +166,11 @@ fn main() -> Result<()> {
             FlushThreshold::Rows(1_000_000)
         }
     };
-    let options = SortingWriterOptions {
-        flush_threshold,
-        merge_sort_batches: cli.merge_sort,
-        ..Default::default()
-    };
+    let options = SortingWriterOptions::builder()
+        .with_flush_threshold(flush_threshold)
+        .with_merge_sort_batches(cli.merge_sort)
+        .with_auto_compact_at(cli.auto_compact_at)
+        .build();
     println!("Sorting Writer Options: {:?}", options);
 
     let output_file = std::fs::File::create(&cli.output)
@@ -206,8 +211,10 @@ fn main() -> Result<()> {
     // Finish phase — sort and merge
     let num_runs = writer.num_run_files();
     println!(
-        "Finishing: {} run file(s) to merge, {} total rows",
-        num_runs, total_rows
+        "Finishing: {} run file(s) to merge, {} total rows, peak merge fan-in {}",
+        num_runs,
+        total_rows,
+        writer.peak_merge_fan_in()
     );
 
     let finish_bar = ProgressBar::new(total_rows);
